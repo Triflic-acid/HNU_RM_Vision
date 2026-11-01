@@ -1,5 +1,6 @@
 #include "io_context.hpp"
 
+#include <cstdio>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -62,6 +63,17 @@ namespace training::io
       }
       return !out.empty();
     }
+    // read() 返回 nullopt 时的限流日志
+    void log_nullopt(const char *why)
+    {
+      static auto next = Clock::now();
+      const auto now = Clock::now();
+      if (now < next)
+        return;
+      next = now + std::chrono::seconds(1);
+      std::printf("[read] -> nullopt (%s)\n", why);
+      std::fflush(stdout);
+    }
 
   } // namespace
 
@@ -108,24 +120,31 @@ namespace training::io
         break;
     }
 
-    if (!latest_image_)
-      return std::nullopt;
+    if (!latest_image_){
+      log_nullopt("No image!");
+      return std::nullopt;}
     const rclcpp::Time stamp(latest_image_->header.stamp);
-    if (have_frame_ && stamp == last_frame_stamp_)
+    if (have_frame_ && stamp == last_frame_stamp_) {
+      log_nullopt("Duplicate!");
       return std::nullopt; // 同一帧不重复
-    if (!latest_recv_)
+      }
+    if (!latest_recv_){
+      log_nullopt("No feedback!");
       return std::nullopt; // 没有姿态
-
+    }
     // 检查图像与反馈的同步性
     const rclcpp::Time feedback_stamp(latest_recv_->header.stamp);
     if (std::llabs((stamp - feedback_stamp).nanoseconds()) > kFeedbackStaleNs)
     {
+      log_nullopt("TLE");
       return std::nullopt;
     }
 
     SensorData data;
-    if (!to_bgr(*latest_image_, data.image))
+    if (!to_bgr(*latest_image_, data.image)){
+      log_nullopt("Bad bgr!");
       return std::nullopt;
+    }
 
     data.timestamp = base_steady_ +
                      std::chrono::nanoseconds((stamp - base_ros_).nanoseconds());
@@ -139,6 +158,19 @@ namespace training::io
 
     have_frame_ = true;
     last_frame_stamp_ = stamp;
+
+    // 演示用
+
+    ++frame_count_;
+    const auto now = Clock::now();
+    if (now >= next_log_)
+    {
+      next_log_ = now + std::chrono::milliseconds(500); // 2 行/秒，视频里更"活"
+      std::printf("[IO] yaw=%7.2f  pitch=%6.2f  bullet=%5.1f m/s  frames=%d\n",
+                  latest_recv_->yaw, latest_recv_->pitch, data.bullet_speed, frame_count_);
+      std::fflush(stdout);
+    }
+
     return data;
   }
 
@@ -152,8 +184,8 @@ namespace training::io
     msg.header.stamp = node_->now();     // 打时间戳(计算结束的时间)
     msg.header.frame_id = "gimbal_link"; // 云台系
 
-    const bool feedback_ok{latest_recv_->work_mode.data == hnurm_interfaces::msg::WorkMode::AUTO_AIM};
-    const bool angle_ok{std::isfinite(command.yaw) && std::isfinite(command.pitch) <= kMaxPitch};
+    const bool feedback_ok{latest_recv_ && latest_recv_->work_mode.data == hnurm_interfaces::msg::WorkMode::AUTO_AIM};
+    const bool angle_ok{std::isfinite(command.yaw) && std::isfinite(command.pitch) && std::abs(command.pitch) <= kMaxPitch};
 
     const bool active{command.control && feedback_ok && angle_ok};
 
@@ -180,6 +212,15 @@ namespace training::io
 
     send_pub_->publish(msg);
 
+    // 演示用
+    static uint8_t last_state = 255;
+    if (msg.target_state.data != last_state)
+    {
+      last_state = msg.target_state.data;
+      std::printf("[Write] target_state -> %u (yaw=%.2f pitch=%.2f)\n",
+                  msg.target_state.data, msg.yaw, msg.pitch);
+      std::fflush(stdout);
+    }
     return;
   }
 

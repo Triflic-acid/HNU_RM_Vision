@@ -40,5 +40,9 @@ namespace training::io
     bool have_frame_{false};
 
     double bullet_speed_{25.0};
+
+    //演示用
+    int frame_count_ = 0;  // 已处理帧数
+    TimePoint next_log_{}; // TimePoint = std::chrono::steady_clock::time_point
   };
 } // namespace training::io

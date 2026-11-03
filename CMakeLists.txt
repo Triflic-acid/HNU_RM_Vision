@@ -6,7 +6,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(hnurm_interfaces REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui calib3d)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui calib3d dnn)
 find_package(Eigen3 REQUIRED)
 find_package(yaml-cpp REQUIRED)
 add_library(training_io io/config.cpp)
@@ -17,6 +17,16 @@ target_compile_options(training_io PRIVATE -Wall -Wextra -Wpedantic)
 add_library(training_lessons lessons/lesson02_io.cpp
  lessons/lesson03_detection.cpp lessons/lesson04_tracking.cpp
  lessons/lesson05_aiming.cpp)
-target_link_libraries(training_lessons PUBLIC training_io)
+
+set(ONNXRUNTIME_ROOT "${CMAKE_SOURCE_DIR}/third_party/onnxruntime")
+
+target_include_directories(training_lessons PRIVATE ${ONNXRUNTIME_ROOT}/include)
+target_link_libraries(training_lessons PUBLIC ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so)
+
+# 让 build/training 运行时能找到 .so（否则要手动设 LD_LIBRARY_PATH）
+set_target_properties(training PROPERTIES
+BUILD_RPATH "${ONNXRUNTIME_ROOT}/lib")
+
+ target_link_libraries(training_lessons PUBLIC training_io)
 add_executable(training src/main.cpp)
 target_link_libraries(training PRIVATE training_lessons)

@@ -5,6 +5,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+
+if(NOT hnurm_interfaces_DIR AND EXISTS
+   "${CMAKE_SOURCE_DIR}/simulation/install_interfaces/hnurm_interfaces/share/hnurm_interfaces/cmake/hnurm_interfacesConfig.cmake")
+  set(hnurm_interfaces_DIR
+      "${CMAKE_SOURCE_DIR}/simulation/install_interfaces/hnurm_interfaces/share/hnurm_interfaces/cmake")
+endif()
+
 find_package(hnurm_interfaces REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui calib3d dnn)
 find_package(Eigen3 REQUIRED)
@@ -23,10 +30,9 @@ set(ONNXRUNTIME_ROOT "${CMAKE_SOURCE_DIR}/third_party/onnxruntime")
 target_include_directories(training_lessons PRIVATE ${ONNXRUNTIME_ROOT}/include)
 target_link_libraries(training_lessons PUBLIC ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so)
 
-# 让 build/training 运行时能找到 .so（否则要手动设 LD_LIBRARY_PATH）
-set_target_properties(training PROPERTIES
-BUILD_RPATH "${ONNXRUNTIME_ROOT}/lib")
+# 让 build/training 运行时能找到 .so（否则要手动设 LD_LIBRARY_PATH
 
  target_link_libraries(training_lessons PUBLIC training_io)
 add_executable(training src/main.cpp)
+set_target_properties(training PROPERTIES BUILD_RPATH "${ONNXRUNTIME_ROOT}/lib")
 target_link_libraries(training PRIVATE training_lessons)

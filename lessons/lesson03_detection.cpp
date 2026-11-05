@@ -1,8 +1,8 @@
 // 第三讲：装甲板检测（YOLO26-Pose + ONNX Runtime）
 //
-// 为什么不用 cv::dnn：系统 OpenCV 4.5.4 解析不了这个 ONNX
-//   （解析 DFL 解码部分的 Add 节点时报 "blob_0.size == blob_1.size"），
-//   换 opset 10/11/12/13、开不开 simplify 都不行；OpenCV 5.0 才支持。
+// 由于 ROS2 Humble 的 OpenCV 4.5.4 太旧，无法解析 ONNX，故不使用 cv::dnn:
+// （解析 DFL 解码部分的 Add 节点时报 "blob_0.size == blob_1.size"），
+// 换 opset 10/11/12/13、开不开 simplify 都不行；OpenCV 5.0 才支持。
 // ONNX Runtime 的 C++ API 没有这个限制，而且推理更快。
 
 #include "lessons.hpp"
@@ -26,7 +26,7 @@ namespace training
     constexpr int kInput{640};
     constexpr float kConfThres{0.25F};
     constexpr float kNmsThres{0.45F};
-    constexpr bool kDetVerbose{true};
+    constexpr bool kDetVerbose{false};
     constexpr const char *kModelPath{"models/best.onnx"};
 
     constexpr const char *kClassNames[] = {
@@ -41,21 +41,25 @@ namespace training
     };
 
     // 编号 / 大小板 映射
+    //   id   : 装甲板编号（1~5），0=哨兵，6=前哨站，-1=未知
+    //   large: 大板 225x125 / 小板 135x125
+    //          据数据集标签实测宽高比（B1/R1=1.84/1.75，其余 ~1.1~1.3），
+    //          只有 1 号英雄是大板。影响第四讲 solvePnP 的物理尺寸。
     constexpr ClassInfo kClassTable[kNumClasses] = {
-        {1, true},   // B1 英雄
-        {2, true},   // B2 工程
-        {3, false},  // B3 步兵
-        {4, false},  // B4 步兵
-        {5, false},  // B5 步兵
-        {-1, false}, // B0 前哨战
-        {7, false},  // BS 哨兵
-        {1, true},   // R1 英雄
-        {2, true},   // R2 工程
-        {3, false},  // R3 步兵
-        {4, false},  // R4 步兵
-        {5, false},  // R5 步兵
-        {-1, false}, // R0 前哨战
-        {7, false},  // RS 哨兵
+        {1, true},  // B1 英雄（大板）
+        {2, false}, // B2 工程
+        {3, false}, // B3 步兵
+        {4, false}, // B4 步兵
+        {5, false}, // B5 步兵
+        {6, false}, // BO 前哨站
+        {0, false}, // BS 哨兵
+        {1, true},  // R1 英雄（大板）
+        {2, false}, // R2 工程
+        {3, false}, // R3 步兵
+        {4, false}, // R4 步兵
+        {5, false}, // R5 步兵
+        {6, false}, // RO 前哨站
+        {0, false}, // RS 哨兵
     };
 
     cv::Mat letterbox(const cv::Mat &src, int size, float &scale, int &pad_x, int &pad_y)
@@ -80,15 +84,28 @@ namespace training
     {
       static std::unique_ptr<Ort::Env> env;
       static std::unique_ptr<Ort::Session> session;
-      if (!session)
+      static bool failed = false;
+
+      if (!session && !failed)
       {
-        env = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "rm_det");
-        Ort::SessionOptions opts;
-        opts.SetIntraOpNumThreads(4);
-        opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-        session = std::make_unique<Ort::Session>(*env, kModelPath, opts);
+        try
+        {
+          env = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "rm_det");
+          Ort::SessionOptions opts;
+          opts.SetIntraOpNumThreads(4);
+          opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+          session = std::make_unique<Ort::Session>(*env, kModelPath, opts);
+        }
+        catch (const std::exception &e)
+        {
+          // 模型缺失/损坏时不要让进程直接 terminate
+          std::printf("[det] 模型加载失败：%s\n[det] 请检查 %s（应在仓库根目录运行）\n",
+                      e.what(), kModelPath);
+          std::fflush(stdout);
+          failed = true;
+        }
       }
-      return session.get();
+      return session.get(); // 失败时为 nullptr
     }
 
   } // namespace
@@ -107,7 +124,8 @@ namespace training
     const cv::Mat padded = letterbox(image, kInput, scale, pad_x, pad_y);
 
     // HWC BGR uint8 -> CHW RGB float 0~1
-    std::vector<float> input(3 * kInput * kInput);
+    // static：复用同一块 4.9 MB 缓冲，避免每帧 malloc/free（单线程安全）
+    static std::vector<float> input(3 * kInput * kInput);
     const int plane = kInput * kInput;
     for (int y = 0; y < kInput; ++y)
     {
@@ -124,6 +142,8 @@ namespace training
 
     // ---- 2. 推理 ----
     auto *session = session_ptr();
+    if (!session)
+      return armors;
     Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     std::array<int64_t, 4> in_shape{1, 3, kInput, kInput};
     Ort::Value tensor = Ort::Value::CreateTensor<float>(

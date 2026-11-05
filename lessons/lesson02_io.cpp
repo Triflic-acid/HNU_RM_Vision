@@ -15,14 +15,14 @@ namespace training::io
   namespace
   {
 
-    constexpr double kDeg2Rad = kPi / 180.0; // 角度制->弧度制
-    constexpr double kRad2Deg = 180.0 / kPi; // 弧度制->角度制
+    constexpr double kDeg2Rad{kPi / 180.0}; // 角度制->弧度制
+    constexpr double kRad2Deg{180.0 / kPi}; // 弧度制->角度制
     // 与 simulation/simulator/config.toml 的 gimbal_pitch_limit 一致
-    constexpr double kMaxPitch = 45.0 * kDeg2Rad;
+    constexpr double kMaxPitch{45.0 * kDeg2Rad};
     // 反馈与图像时间差超过设定值默认认反馈过期
-    constexpr int64_t kFeedbackStaleNs = 100'000'000; // 100 ms
+    constexpr int64_t kFeedbackStaleNs{100'000'000}; // 100 ms
     // read() 一帧等待的最长时间，超时返回 nullopt（使主循环发出停止指令）
-    constexpr auto kFrameTimeout = std::chrono::milliseconds(50);
+    constexpr auto kFrameTimeout{std::chrono::milliseconds(50)};
 
     // 姿态角（deg，pitch 抬头为正）-> 四元数（x前 y左 z上）
     Eigen::Quaterniond to_quaternion(double yaw_deg, double pitch_deg, double roll_deg)
@@ -42,25 +42,33 @@ namespace training::io
         return false;
       const int width = static_cast<int>(msg.width);
       const int height = static_cast<int>(msg.height);
-      auto *data = const_cast<unsigned char *>(msg.data.data()); // 只读视图，随后立刻clone
+      auto *data = const_cast<unsigned char *>(msg.data.data()); // 只读视图，随后立刻 clone
+
+      int type = 0;
+      int code = -1;
       if (msg.encoding == "bgr8")
       {
-        out = cv::Mat(height, width, CV_8UC3, data, msg.step).clone();
+        type = CV_8UC3;
       }
       else if (msg.encoding == "rgb8")
       {
-        const cv::Mat view(height, width, CV_8UC3, data, msg.step);
-        cv::cvtColor(view, out, cv::COLOR_RGB2BGR);
+        type = CV_8UC3;
+        code = cv::COLOR_RGB2BGR;
       }
       else if (msg.encoding == "mono8")
       {
-        const cv::Mat view(height, width, CV_8UC1, data, msg.step);
-        cv::cvtColor(view, out, cv::COLOR_GRAY2BGR);
+        type = CV_8UC1;
+        code = cv::COLOR_GRAY2BGR;
       }
       else
       {
         return false;
       }
+
+      const cv::Mat view(height, width, type, data, msg.step);
+      out = view.clone();                          // 一次分配
+      if (code >= 0)
+        cv::cvtColor(out, out, code);              // 原地转换节约一次分配
       return !out.empty();
     }
     // read() 返回 nullopt 时的限流日志
@@ -112,7 +120,11 @@ namespace training::io
 
     while (Clock::now() < ddl)
     {
-      executor_->spin_once(std::chrono::milliseconds(2));
+      // 直接用剩余时间：有消息立刻返回，无消息则睡到截止，避免 2 ms 空转
+      const auto remain = std::chrono::duration_cast<std::chrono::nanoseconds>(ddl - Clock::now());
+      if (remain.count() <= 0)
+        break;
+      executor_->spin_once(remain);
       if (!latest_image_)
         continue;
       const rclcpp::Time stamp(latest_image_->header.stamp);
@@ -120,15 +132,19 @@ namespace training::io
         break;
     }
 
-    if (!latest_image_){
+    if (!latest_image_)
+    {
       log_nullopt("No image!");
-      return std::nullopt;}
+      return std::nullopt;
+    }
     const rclcpp::Time stamp(latest_image_->header.stamp);
-    if (have_frame_ && stamp == last_frame_stamp_) {
+    if (have_frame_ && stamp == last_frame_stamp_)
+    {
       log_nullopt("Duplicate!");
       return std::nullopt; // 同一帧不重复
-      }
-    if (!latest_recv_){
+    }
+    if (!latest_recv_)
+    {
       log_nullopt("No feedback!");
       return std::nullopt; // 没有姿态
     }
@@ -141,7 +157,8 @@ namespace training::io
     }
 
     SensorData data;
-    if (!to_bgr(*latest_image_, data.image)){
+    if (!to_bgr(*latest_image_, data.image))
+    {
       log_nullopt("Bad bgr!");
       return std::nullopt;
     }

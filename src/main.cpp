@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <csignal>
 #include <vector>
+#include <cmath>
 
 namespace
 {
@@ -17,7 +18,7 @@ namespace
   {
     for (const auto &a : armors)
     {
-      for (int i = 0; i < 4; ++i)
+      for (int i = 0; i < 4; i++)
         cv::line(canvas, a.corners[i], a.corners[(i + 1) % 4],
                  cv::Scalar(0, 255, 0), 2);
       for (const auto &p : a.corners)
@@ -30,6 +31,8 @@ namespace
                   cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
     }
   }
+
+  constexpr bool kDemoWrite{false}; // write()函数测试开关
 }
 
 int main(int argc, char **argv)
@@ -59,12 +62,34 @@ int main(int argc, char **argv)
     }
     if (interrupted)
       break;
+
+    if (kDemoWrite)
+    {
+      const double t{std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count()};
+
+      command.control = true;
+      command.shoot = false;
+      command.yaw = -1.5708 + 0.6 * std::sin(t * 0.5);
+      command.pitch = 0.4363 + 0.10 + 0.05 * std::sin(t * 0.3);
+    }
+
     devices.write(command);
 
-    if (input && devices.config.display)
+    if (devices.config.display)
     {
-      cv::Mat canvas{input->image.clone()};
-      draw_armors(canvas, armors);
+      // 没有新帧时也应当刷新窗口，否则窗口会假死、按键无响应
+      cv::Mat canvas;
+      if (input)
+      {
+        canvas = input->image.clone();
+        draw_armors(canvas, armors);
+      }
+      else
+      {
+        canvas = cv::Mat(240, 640, CV_8UC3, cv::Scalar(30, 30, 30));
+        cv::putText(canvas, "waiting for /image_raw ...", cv::Point(20, 130),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 200, 255), 2);
+      }
 
       cv::imshow("RoboMaster training", canvas);
       const int key = cv::waitKey(1);

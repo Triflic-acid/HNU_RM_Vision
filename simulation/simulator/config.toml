@@ -21,7 +21,7 @@ enabled = true
 shadows = false
 # Main on-screen camera anti-aliasing.
 main_camera_fxaa = false
-illuminance = 500.0
+illuminance = 700.0
 
 [vision]
 # What a camera sees, rather than what looks right in the preview window.
@@ -30,7 +30,7 @@ illuminance = 500.0
 # thresholds at. That stage does not produce detections (the YOLOv5 network does) but it
 # is the corner-refinement pass that runs inside every detection; at 142 it never fires.
 # Scaling only the emissive term leaves geometry, hitboxes and rule timing untouched.
-armor_emissive_scale = 3.0
+armor_emissive_scale = 4.0
 # Real glass spreads a blown-out LED into a halo wider than the emitter itself.
 bloom_intensity = 0.0
 # Sensor noise in grey levels added to published frames (0 = pristine render).

@@ -1,6 +1,8 @@
 #include "lessons.hpp"
 #include "io_context.hpp"
 
+#include "debug_flags.hpp"
+
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -10,6 +12,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <optional>
 
 namespace
 {
@@ -99,7 +102,49 @@ namespace
     }
   }
 
-  constexpr bool kDemoWrite{false}; // write()函数测试开关
+  // 圆心时序滤波：在【原图坐标】里做，避免与 ROI 裁剪坐标混用。
+  // 连续 kEscape 次都判为"跳变"就认为旧值错了，接受新值（否则会永久锁死）。
+  struct RuneCenterFilter
+  {
+    static constexpr int kLostMax{3};
+    static constexpr int kEscape{5};
+
+    cv::Point2f last{-1.F, -1.F};
+    int lost{0};
+    int rejects{0};
+
+    std::optional<cv::Point2f> apply(const std::optional<cv::Point2f> &in, float limit)
+    {
+      if (in)
+      {
+        if (last.x >= 0.F && cv::norm(*in - last) > limit)
+        {
+          if (++rejects < kEscape)
+            return last;
+          rejects = 0;
+        }
+        else
+        {
+          rejects = 0;
+        }
+        last = *in;
+        lost = 0;
+        return last;
+      }
+      if (last.x >= 0.F && ++lost <= kLostMax)
+        return last;
+      last = cv::Point2f(-1.F, -1.F);
+      lost = 0;
+      return std::nullopt;
+    }
+
+    void reset()
+    {
+      last = cv::Point2f(-1.F, -1.F);
+      lost = 0;
+      rejects = 0;
+    }
+  };
 
   enum class RoiMode
   {
@@ -128,6 +173,19 @@ namespace
   }
 }
 
+
+
+namespace training::dbg
+{
+  bool io{true};          // [IO] 帧率/姿态、[read] nullopt、[Write]
+  bool det{false};        // [det] 每帧检测耗时、模型/模板加载
+  bool rune{true};       // [rune] 圆心 r/w、模板分数
+  bool gui{true};         // [gui] 按键切换提示
+  bool demo_write{false}; // 演示：无视算法输出，向云台发出按正弦函数运动的指令
+} // namespace training::dbg
+
+
+
 int main(int argc, char **argv)
 {
   std::signal(SIGINT, on_signal);
@@ -143,6 +201,7 @@ int main(int argc, char **argv)
   RoiMode roi_mode = RoiMode::kOff;
   const float manual_zoom = 2.0F;
   RefineMode refine_mode = RefineMode::kOff;
+  RuneCenterFilter rune_filter;
   const int subpix_win = 5;
   double last_ms = 0.0;
 
@@ -195,6 +254,18 @@ int main(int argc, char **argv)
           training::lesson03_refine_quad_lines(input->image, detections);
       }
 
+      // 能量机关圆心：在【原图坐标】里做时序滤波。
+      // lesson03 只负责单帧；若把时序放进 lesson03，ROI 裁剪坐标会和原图坐标混用，
+      // 表现为圆心被锁到画面角落再也回不来。
+      if (mode == training::DetMode::kRune && !detections.empty())
+      {
+        const float w = std::max(detections.front().box.width, 4.F);
+        const auto filtered = rune_filter.apply(detections.front().center,
+                                                std::max(0.6F * w, 12.F));
+        for (auto &d : detections)
+          d.center = filtered;
+      }
+
       // 计时
       last_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
@@ -215,7 +286,7 @@ int main(int argc, char **argv)
     if (interrupted)
       break;
 
-    if (kDemoWrite)
+    if (training::dbg::demo_write)
     {
       const double t{std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count()};
 
@@ -270,6 +341,7 @@ int main(int argc, char **argv)
         mode = (mode == training::DetMode::kArmor) ? training::DetMode::kRune
                                                    : training::DetMode::kArmor;
         tracking = training::TrackingState{};
+        rune_filter.reset();
       }
       else if (key == 'z' || key == 'Z')
       {

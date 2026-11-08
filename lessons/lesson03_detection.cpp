@@ -15,6 +15,8 @@
 
 #include "lessons.hpp"
 
+#include "debug_flags.hpp"
+
 #include <onnxruntime_cxx_api.h>
 #include <opencv2/dnn.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -40,11 +42,10 @@ namespace training
     constexpr int kInput{640};
     constexpr float kConfThres{0.25F};
     constexpr float kNmsThres{0.45F};
-    constexpr bool kDetVerbose{false};
 
     // ==== 能量机关圆心 R logo（模板匹配）====
-    constexpr float kMatchThres{0.55F}; // 响应 0.96~0.99
-    constexpr float kRatioLo{2.0F};     // 圆心半径下限 = 2.0 * 叶片框宽
+    constexpr float kMatchThres{0.70F}; // 响应 0.96~0.99
+    constexpr float kRatioLo{0.8F};     // 圆心半径下限 = 0.8 * 叶片框宽
     constexpr float kRatioHi{3.4F};     // 圆心半径上限 = 3.4 * 叶片框宽
 
     struct ClassInfo
@@ -165,12 +166,13 @@ namespace training
             continue;
           tpls.push_back(value_channel(bgr)); // V 通道：红/蓝通吃
         }
+
         if (tpls.empty())
         {
           std::printf("[det] 能量机关模板缺失：assets/rune_logo*.png\n");
           std::fflush(stdout);
         }
-        else
+        else if (training::dbg::det)
         {
           std::printf("[det] 能量机关模板 %zu 张\n", tpls.size());
           std::fflush(stdout);
@@ -265,6 +267,14 @@ namespace training
 
       if (best && best_score >= kMatchThres)
       {
+        if (training::dbg::rune)
+        {
+          const float rr = cv::norm(*best - blade_center) / w;
+          std::printf("[rune] w=%.0f r/w=%.2f score=%.3f center=(%.0f,%.0f)\n",
+                      w, rr, best_score, best->x, best->y);
+          std::fflush(stdout);
+        }
+        
         score = best_score;
         return best;
       }
@@ -380,7 +390,7 @@ namespace training
 
     if (boxes.empty())
     {
-      if (kDetVerbose)
+      if (training::dbg::det)
       {
         const auto ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
         std::printf("[det] %.1f ms, 0 targets\n", ms);
@@ -444,7 +454,7 @@ namespace training
       }
     }
 
-    if (kDetVerbose)
+    if (training::dbg::det)
     {
       const auto ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
       std::printf("[det] %s %.1f ms, %zu targets\n",

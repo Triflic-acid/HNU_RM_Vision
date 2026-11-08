@@ -1,5 +1,7 @@
 #include "io_context.hpp"
 
+#include "debug_flags.hpp"
+
 #include <cstdio>
 #include <chrono>
 #include <cmath>
@@ -66,9 +68,9 @@ namespace training::io
       }
 
       const cv::Mat view(height, width, type, data, msg.step);
-      out = view.clone();                          // 一次分配
+      out = view.clone(); // 一次分配
       if (code >= 0)
-        cv::cvtColor(out, out, code);              // 原地转换节约一次分配
+        cv::cvtColor(out, out, code); // 原地转换节约一次分配
       return !out.empty();
     }
     // read() 返回 nullopt 时的限流日志
@@ -79,7 +81,8 @@ namespace training::io
       if (now < next)
         return;
       next = now + std::chrono::seconds(1);
-      std::printf("[read] -> nullopt (%s)\n", why);
+      if (training::dbg::io)
+        std::printf("[read] -> nullopt (%s)\n", why);
       std::fflush(stdout);
     }
 
@@ -177,14 +180,14 @@ namespace training::io
     last_frame_stamp_ = stamp;
 
     // 演示用
-
-    ++frame_count_;
+    frame_count_++;
     const auto now = Clock::now();
     if (now >= next_log_)
     {
       next_log_ = now + std::chrono::milliseconds(500); // 2 行/秒，视频里更"活"
-      std::printf("[IO] yaw=%7.2f  pitch=%6.2f  bullet=%5.1f m/s  frames=%d\n",
-                  latest_recv_->yaw, latest_recv_->pitch, data.bullet_speed, frame_count_);
+      if (training::dbg::io)
+        std::printf("[IO] yaw=%7.2f  pitch=%6.2f  bullet=%5.1f m/s  frames=%d\n",
+                    latest_recv_->yaw, latest_recv_->pitch, data.bullet_speed, frame_count_);
       std::fflush(stdout);
     }
 
@@ -234,8 +237,9 @@ namespace training::io
     if (msg.target_state.data != last_state)
     {
       last_state = msg.target_state.data;
-      std::printf("[Write] target_state -> %u (yaw=%.2f pitch=%.2f)\n",
-                  msg.target_state.data, msg.yaw, msg.pitch);
+      if (training::dbg::io)
+        std::printf("[Write] target_state -> %u (yaw=%.2f pitch=%.2f)\n",
+                    msg.target_state.data, msg.yaw, msg.pitch);
       std::fflush(stdout);
     }
     return;

@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <csignal>
+#include <string>
 #include <vector>
 #include <cmath>
 
@@ -13,22 +14,87 @@ namespace
 {
   volatile std::sig_atomic_t interrupted = 0;
   void on_signal(int) { interrupted = 1; }
-  // 画检测框：四边 + 四角 + 类别&置信度
-  void draw_armors(cv::Mat &canvas, const std::vector<training::Armor> &armors)
+
+  // 统一画法：四边 + 编号角点 1~4 + 标签
+  //   armor 点序 左上、右上、右下、左下（顺时针）
+  //   rune  点序 左上、左下、右下、右上（逆时针）
+  void draw_quad(cv::Mat &canvas,
+                 const std::array<cv::Point2f, 4> &corners,
+                 const cv::Scalar &edge, const cv::Scalar &dot,
+                 const std::string &tag)
   {
-    for (const auto &a : armors)
+    for (int i = 0; i < 4; ++i)
+      cv::line(canvas, corners[i], corners[(i + 1) % 4], edge, 2, cv::LINE_AA);
+
+    for (int i = 0; i < 4; ++i)
     {
-      for (int i = 0; i < 4; i++)
-        cv::line(canvas, a.corners[i], a.corners[(i + 1) % 4],
-                 cv::Scalar(0, 255, 0), 2);
-      for (const auto &p : a.corners)
-        cv::circle(canvas, cv::Point(cvRound(p.x), cvRound(p.y)), 3,
-                   cv::Scalar(0, 0, 255), -1);
+      const cv::Point pt(cvRound(corners[i].x), cvRound(corners[i].y));
+      cv::circle(canvas, pt, 3, dot, -1, cv::LINE_AA);
+      cv::putText(canvas, std::to_string(i + 1), pt + cv::Point(5, -5),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.5, dot, 2, cv::LINE_AA);
+    }
+
+    if (!tag.empty())
+      cv::putText(canvas, tag,
+                  cv::Point(cvRound(corners[0].x), cvRound(corners[0].y) - 10),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.6, edge, 2, cv::LINE_AA);
+  }
+
+  void draw_armors(cv::Mat &canvas, const std::vector<training::Detection> &dets)
+  {
+    for (const auto &d : dets)
+    {
       char text[64];
-      std::snprintf(text, sizeof(text), "id=%d %.2f", a.class_id, a.confidence);
-      cv::putText(canvas, text,
-                  cv::Point(cvRound(a.corners[0].x), cvRound(a.corners[0].y) - 8),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
+      std::snprintf(text, sizeof(text), "id=%d %.2f", d.class_id, d.confidence);
+      draw_quad(canvas, d.corners, cv::Scalar(0, 255, 0), cv::Scalar(0, 0, 255), text);
+    }
+  }
+
+  // 打符：叶片四角 + 靶心 + 圆心
+  void draw_runes(cv::Mat &canvas, const std::vector<training::Detection> &dets)
+  {
+    const cv::Scalar kLogo(255, 200, 0); // 青
+    const cv::Scalar kAim(0, 0, 255);    // 红
+
+    for (size_t i = 0; i < dets.size(); ++i)
+    {
+      char text[64];
+      std::snprintf(text, sizeof(text), "RUNE%zu %.2f", i + 1, dets[i].confidence);
+      draw_quad(canvas, dets[i].corners, cv::Scalar(0, 255, 0), cv::Scalar(0, 165, 255), text);
+    }
+    if (dets.empty())
+      return;
+
+    const auto &center = dets.front().center;
+
+    // 标注圆心
+    if (center)
+    {
+      const cv::Point c(cvRound(center->x), cvRound(center->y));
+      cv::drawMarker(canvas, c, kLogo, cv::MARKER_CROSS, 18, 2, cv::LINE_AA);
+      cv::circle(canvas, c, 10, kLogo, 2, cv::LINE_AA);
+      cv::putText(canvas, "R", c + cv::Point(12, -12),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.6, kLogo, 2, cv::LINE_AA);
+    }
+
+    // 靶心（每片叶子的中心）
+    for (const auto &d : dets)
+    {
+      const cv::Point2f t = (d.corners[0] + d.corners[1] + d.corners[2] + d.corners[3]) * 0.25F;
+      const cv::Point c(cvRound(t.x), cvRound(t.y));
+      cv::drawMarker(canvas, c, kAim, cv::MARKER_TILTED_CROSS, 22, 2, cv::LINE_AA);
+      cv::circle(canvas, c, 12, kAim, 2, cv::LINE_AA);
+
+      if (center)
+      {
+        const double r = cv::norm(t - *center);
+        cv::line(canvas, c, cv::Point(cvRound(center->x), cvRound(center->y)),
+                 kAim, 1, cv::LINE_AA);
+        char text[64];
+        std::snprintf(text, sizeof(text), "r=%.0fpx", r);
+        cv::putText(canvas, text, c + cv::Point(14, 18),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, kAim, 2, cv::LINE_AA);
+      }
     }
   }
 
@@ -45,20 +111,26 @@ int main(int argc, char **argv)
   training::TrackingState tracking;
   devices.open();
 
+  training::DetMode mode{training::DetMode::kArmor}; // 默认自瞄；按 m 切换
+
   while (!interrupted)
   {
     const auto input = devices.read();
 
     training::Command command{};
-    std::vector<training::Armor> armors;
+    std::vector<training::Detection> detections;
+    bool has_logo = false;
 
     if (input)
     {
-      armors = training::lesson03_detection(input->image);
+      detections = training::lesson03_detection(input->image, mode);
       const auto target = training::lesson04_tracking(
-          armors, input->timestamp, input->imu_q, calibration, tracking);
+          detections, mode, input->timestamp, input->imu_q, calibration, tracking);
       if (target)
         command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
+
+      if (mode == training::DetMode::kRune && !detections.empty())
+        has_logo = detections.front().center.has_value();
     }
     if (interrupted)
       break;
@@ -82,7 +154,10 @@ int main(int argc, char **argv)
       if (input)
       {
         canvas = input->image.clone();
-        draw_armors(canvas, armors);
+        if (mode == training::DetMode::kArmor)
+          draw_armors(canvas, detections);
+        else
+          draw_runes(canvas, detections);
       }
       else
       {
@@ -91,10 +166,33 @@ int main(int argc, char **argv)
                     cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 200, 255), 2);
       }
 
+      {
+        char hud[160];
+        if (mode == training::DetMode::kArmor)
+          std::snprintf(hud, sizeof(hud), "[MODE] ARMOR   %zu targets    (m: switch)",
+                        detections.size());
+        else
+          std::snprintf(hud, sizeof(hud), "[MODE] RUNE    %zu blades   logo:%s    (m: switch)",
+                        detections.size(), has_logo ? "Y" : "N");
+        cv::putText(canvas, hud, cv::Point(12, 26), cv::FONT_HERSHEY_SIMPLEX, 0.65,
+                    mode == training::DetMode::kArmor ? cv::Scalar(0, 255, 0)
+                                                      : cv::Scalar(0, 128, 255),
+                    2);
+      }
+
       cv::imshow("RoboMaster training", canvas);
       const int key = cv::waitKey(1);
       if (key == 27 || key == 'q')
         break;
+      if (key == 'm' || key == 'M' || key == '\t')
+      {
+        mode = (mode == training::DetMode::kArmor) ? training::DetMode::kRune
+                                                   : training::DetMode::kArmor;
+        tracking = training::TrackingState{};
+        std::printf("[gui] 切换到 %s 模式\n",
+                    mode == training::DetMode::kArmor ? "自瞄(ARMOR)" : "打符(RUNE)");
+        std::fflush(stdout);
+      }
     }
   }
 

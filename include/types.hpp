@@ -3,6 +3,7 @@
 #include <opencv2/core.hpp>
 #include <array>
 #include <chrono>
+#include <optional>
 
 namespace training {
 using Clock = std::chrono::steady_clock;
@@ -26,13 +27,30 @@ struct SensorData {
   double bullet_speed = 0;  // m/s
 };
 
-// 第三讲输出：一块装甲板的图像观测。
-struct Armor {
-  std::array<cv::Point2f, 4> corners{};  // 左上、右上、右下、左下
-  bool large_armor = false;
-  int class_id = -1;
+// 第三讲的两种识别模式：
+//   kArmor : 装甲板（14 类，kpt_shape [4,2]，输出 [1,26,8400]）
+//   kRune  : 能量机关叶片（1 类，kpt_shape [4,2]，输出 [1,13,8400]）
+enum class DetMode { kArmor, kRune };
+
+// 第三讲输出：一个目标的图像观测（装甲板或符文叶片共用）。
+//
+// corners 点序随模式不同，务必看清：
+//   kArmor : 左上、右上、右下、左下（顺时针）
+//   kRune  : 左上、左下、右下、右上（逆时针，与符文数据集一致）
+struct Detection {
+  std::array<cv::Point2f, 4> corners{};
+  cv::Rect2f box{};
+  int class_id = -1;        // 装甲板：编号 0~6；符文：恒为 0
+  bool large_armor = false; // 仅装甲板有效（大板 225x125 / 小板 135x125）
   double confidence = 0;
+  // 仅符文有效：R 标圆心（模板匹配得到，全帧共享）。
+  // 为什么不让网络回归：圆心距叶片约 260 px，网络预测会塌到叶片附近，
+  // 把 Pose mAP50-95 从 0.995 压到 0.597。
+  std::optional<cv::Point2f> center;
 };
+
+// 兼容旧名字：第三讲原来的返回值类型
+using Armor = Detection;
 
 // 第四讲输出：当前观测时刻的单目标状态。无目标用 std::nullopt 表示。
 struct Target {

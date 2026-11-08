@@ -288,8 +288,7 @@ namespace training
     int pad_x{0}, pad_y{0};
     const cv::Mat padded = letterbox(image, kInput, scale, pad_x, pad_y);
 
-    // static：复用同一块 4.9 MB 缓冲，避免每帧 malloc/free（单线程安全）
-    static std::vector<float> input(3 * kInput * kInput);
+        static std::vector<float> input(3 * kInput * kInput); // 复用缓冲区
     const int plane = kInput * kInput;
     for (int y = 0; y < kInput; ++y)
     {
@@ -412,7 +411,7 @@ namespace training
       }
       else
       {
-        // 符文：点序与数据集一致，直接用 左上、左下、右下、右上
+        // 能量机关：点序与数据集一致，直接用 左上、左下、右下、右上
         d.corners = kpts[idx];
         d.class_id = 0;
         d.large_armor = false;

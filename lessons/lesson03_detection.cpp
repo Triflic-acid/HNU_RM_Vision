@@ -8,10 +8,10 @@
 // 支持两种模型，由 DetMode 选择：
 //
 //   kArmor  装甲板   14 类  kpt_shape [4,2]  输出 [1, 26, 8400]
-//   kRune   符文叶片  1 类  kpt_shape [4,2]  输出 [1, 13, 8400]
+//   kRune   能量机关叶片  1 类  kpt_shape [4,2]  输出 [1, 13, 8400]
 //
 // 两者解码完全一致：nc = C - 4 - 8；差别只有模型文件、类别表、角点顺序，
-// 以及符文要多一步 R 标圆心（模板匹配）。
+// 能量机关多一步 R 标圆心（模板匹配）。
 
 #include "lessons.hpp"
 
@@ -28,6 +28,8 @@
 #include <cstdlib>
 #include <memory>
 #include <vector>
+#include <string>
+#include <filesystem>
 
 namespace training
 {
@@ -40,7 +42,7 @@ namespace training
     constexpr float kNmsThres{0.45F};
     constexpr bool kDetVerbose{false};
 
-    // ---- 能量机关圆心 R logo（模板匹配）----
+    // ==== 能量机关圆心 R logo（模板匹配）====
     constexpr float kMatchThres{0.55F}; // 响应 0.96~0.99
     constexpr float kRatioLo{2.0F};     // 圆心半径下限 = 2.0 * 叶片框宽
     constexpr float kRatioHi{3.4F};     // 圆心半径上限 = 3.4 * 叶片框宽
@@ -132,11 +134,7 @@ namespace training
     }
 
     // 颜色无关的强度图：V = max(R,G,B)
-    //
-    // 红方/蓝方的 R 标色相不同，但都是"彩色高饱和发光体"：
-    //   灰度 = 0.299R + 0.587G + 0.114B  → 红 logo 亮、蓝 logo 暗，模板对不上
-    //   V    = max(R,G,B)                → 两种颜色都接近饱和，形状一致
-    // 实测（红/蓝各 60 张）：灰度 蓝方命中 7/60；V 通道 红蓝各 60/60。
+
     cv::Mat value_channel(const cv::Mat &bgr)
     {
       cv::Mat hsv, v;
@@ -145,7 +143,7 @@ namespace training
       return v;
     }
 
-    // ---- 能量机关平均模板 ----
+    // ==== 能量机关平均模板 ====
     const std::vector<cv::Mat> &rune_templates()
     {
       static std::vector<cv::Mat> tpls;
@@ -169,12 +167,12 @@ namespace training
         }
         if (tpls.empty())
         {
-          std::printf("[det] 符文模板缺失：assets/rune_logo*.png\n");
+          std::printf("[det] 能量机关模板缺失：assets/rune_logo*.png\n");
           std::fflush(stdout);
         }
         else
         {
-          std::printf("[det] 符文模板 %zu 张\n", tpls.size());
+          std::printf("[det] 能量机关模板 %zu 张\n", tpls.size());
           std::fflush(stdout);
         }
       }
@@ -283,12 +281,12 @@ namespace training
 
     const auto t0 = Clock::now();
 
-    // ---- 1. 预处理 ----
+    // ==== 1. 预处理 ====
     float scale{1.F};
     int pad_x{0}, pad_y{0};
     const cv::Mat padded = letterbox(image, kInput, scale, pad_x, pad_y);
 
-        static std::vector<float> input(3 * kInput * kInput); // 复用缓冲区
+    static std::vector<float> input(3 * kInput * kInput); // 复用缓冲区
     const int plane = kInput * kInput;
     for (int y = 0; y < kInput; ++y)
     {
@@ -303,7 +301,7 @@ namespace training
       }
     }
 
-    // ---- 2. 推理 ----
+    // ==== 2. 推理 ====
     auto *session = session_ptr(mode);
     if (!session)
       return detections;
@@ -331,7 +329,7 @@ namespace training
 
     const float *p = outputs[0].GetTensorData<float>();
 
-    // ---- 3. 解码 ----
+    // ==== 3. 解码 ====
     std::vector<cv::Rect> boxes;
     std::vector<float> scores;
     std::vector<int> class_ids;
@@ -390,11 +388,11 @@ namespace training
       return detections;
     }
 
-    // ---- 4. NMS ----
+    // ==== 4. NMS ====
     std::vector<int> keep;
     cv::dnn::NMSBoxes(boxes, scores, kConfThres, kNmsThres, keep);
 
-    // ---- 5. 组装 ----
+    // ==== 5. 组装 ====
     detections.reserve(keep.size());
     for (const int idx : keep)
     {
@@ -404,7 +402,7 @@ namespace training
 
       if (mode == DetMode::kArmor)
       {
-        // 模型点序 左上、左下、右下、右上 → Armor 要求 左上、右上、右下、左下
+        // 模型点序 左上、左下、右下、右上 -> Armor 要求 左上、右上、右下、左下
         d.corners = {kpts[idx][0], kpts[idx][3], kpts[idx][2], kpts[idx][1]};
         d.class_id = kArmorTable[class_ids[idx]].id;
         d.large_armor = kArmorTable[class_ids[idx]].large;
@@ -419,7 +417,7 @@ namespace training
       detections.push_back(d);
     }
 
-    // ---- 6. 能量机关圆心（仅在找到叶片的情况下搜索）----
+    // ==== 6. 能量机关圆心（仅在找到叶片的情况下搜索）====
     if (mode == DetMode::kRune && !detections.empty())
     {
       const auto &tpls = rune_templates();
@@ -455,6 +453,293 @@ namespace training
     }
 
     return detections;
+  }
+
+  // 模块 A：ROI 放大推理、
+
+  // 以 center 为中心裁出一个正方形（边长 = 图像宽 / zoom），resize 到 640 后复用 lesson03_detection（内部 letterbox 对 640 是恒等），再把结果按 sx/sy 换算回原图
+  // ROI 为方形，x/y scale 相同，不会引入 letterbox 的不等比
+  std::vector<Detection> lesson03_detection_roi(const cv::Mat &image,
+                                                cv::Point2f center,
+                                                float zoom,
+                                                DetMode mode)
+  {
+    std::vector<Detection> out;
+    if (image.empty() || image.type() != CV_8UC3 || zoom <= 0.1F)
+      return out;
+    int side = static_cast<int>(std::round(image.cols / zoom));
+    side = std::min(side, std::min(image.cols, image.rows));
+    if (side < 32)
+      return out;
+    int x = static_cast<int>(std::round(center.x - side / 2.0));
+    int y = static_cast<int>(std::round(center.y - side / 2.0));
+    x = std::clamp(x, 0, image.cols - side);
+    y = std::clamp(y, 0, image.rows - side);
+    const cv::Mat crop = image(cv::Rect(x, y, side, side));
+    cv::Mat up;
+    cv::resize(crop, up, cv::Size(kInput, kInput), 0, 0, cv::INTER_LINEAR);
+    out = lesson03_detection(up, mode);
+    const float sx = static_cast<float>(side) / kInput;
+    const float sy = sx;
+    for (auto &d : out)
+    {
+      for (auto &c : d.corners)
+      {
+        c.x = c.x * sx + x;
+        c.y = c.y * sy + y;
+      }
+      d.box.x = d.box.x * sx + x;
+      d.box.y = d.box.y * sy + y;
+      d.box.width *= sx;
+      d.box.height *= sy;
+      if (d.center)
+      {
+        d.center->x = d.center->x * sx + x;
+        d.center->y = d.center->y * sy + y;
+      }
+    }
+    return out;
+  }
+  // 模块 B：亚像素角点精修
+
+  // 直对原图做 cornerSubPix
+  // 点锁定在图像内（3 px 边距），否则 OpenCV 会抛异常
+  // 位移超过 max_shift 视为精修失败 -> 保留网络原值
+  // 精修后必须仍是凸四边形，否则丢弃
+  namespace
+  {
+    bool quad_is_convex(const std::array<cv::Point2f, 4> &q)
+    {
+      float s[4];
+      for (int i = 0; i < 4; ++i)
+      {
+        const auto &a = q[i], &b = q[(i + 1) % 4], &c = q[(i + 2) % 4];
+        s[i] = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+      }
+      const bool pos = std::all_of(s, s + 4, [](float v)
+                                   { return v > 0; });
+      const bool neg = std::all_of(s, s + 4, [](float v)
+                                   { return v < 0; });
+      return pos || neg;
+    }
+  } // namespace
+  void lesson03_refine_subpix(const cv::Mat &image,
+                              std::vector<Detection> &detections,
+                              int win,
+                              float max_shift)
+  {
+    if (image.empty() || detections.empty())
+      return;
+    cv::Mat gray;
+    cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+    const int w = std::max(3, win | 1); // 强制奇数
+    for (auto &d : detections)
+    {
+      std::vector<cv::Point2f> pts(d.corners.begin(), d.corners.end());
+      for (auto &p : pts)
+      {
+        p.x = std::clamp(p.x, 3.F, static_cast<float>(image.cols - 4));
+        p.y = std::clamp(p.y, 3.F, static_cast<float>(image.rows - 4));
+      }
+      std::vector<cv::Point2f> refined = pts;
+      try
+      {
+        cv::cornerSubPix(gray, refined, cv::Size(w, w), cv::Size(-1, -1),
+                         cv::TermCriteria(cv::TermCriteria::EPS | cv::TermCriteria::MAX_ITER,
+                                          20, 0.03));
+      }
+      catch (const cv::Exception &)
+      {
+        continue; // 精修失败，保留原值
+      }
+      bool ok = true;
+      for (int i = 0; i < 4; ++i)
+        if (cv::norm(refined[i] - d.corners[i]) > max_shift)
+          ok = false;
+      const std::array<cv::Point2f, 4> cand{refined[0], refined[1], refined[2], refined[3]};
+      if (!ok || !quad_is_convex(cand))
+        continue;
+      d.corners = cand;
+    }
+  }
+
+  // 模块 C：四边拟合直线 -> 求交（用于装甲板/能量机关的精修）
+
+  // 沿法向搜索梯度极值 -> 亚像素点
+  // 每条边取十几个点做最小二乘 -> 单点噪声被摊薄（1/√n）
+  // 相邻两条边求交 -> 交点天然亚像素
+  namespace
+  {
+    // 双线性采样
+    inline float sample_bilinear(const cv::Mat &g, float x, float y)
+    {
+      if (x < 0.F || y < 0.F || x >= g.cols - 1.F || y >= g.rows - 1.F)
+        return 0.F;
+      const int x0 = static_cast<int>(x), y0 = static_cast<int>(y);
+      const float fx = x - x0, fy = y - y0;
+      const float v00 = g.at<uchar>(y0, x0), v01 = g.at<uchar>(y0, x0 + 1);
+      const float v10 = g.at<uchar>(y0 + 1, x0), v11 = g.at<uchar>(y0 + 1, x0 + 1);
+      return (v00 * (1 - fx) + v01 * fx) * (1 - fy) + (v10 * (1 - fx) + v11 * fx) * fy;
+    }
+    // 沿法向一维搜索梯度极值，抛物线插值到亚像素
+    bool edge_point_1d(const cv::Mat &g, cv::Point2f seed, cv::Point2f nrm,
+                       int radius, cv::Point2f &out)
+    {
+      const int N = 2 * radius + 1;
+      std::vector<float> prof(N);
+      for (int i = 0; i < N; ++i)
+      {
+        const float t = static_cast<float>(i - radius);
+        prof[i] = sample_bilinear(g, seed.x + nrm.x * t, seed.y + nrm.y * t);
+      }
+      int best = -1;
+      float best_v = 0.F;
+      for (int i = 1; i < N - 1; ++i)
+      {
+        const float grad = std::abs(prof[i + 1] - prof[i - 1]) * 0.5F;
+        if (grad > best_v)
+        {
+          best_v = grad;
+          best = i;
+        }
+      }
+      if (best <= 0 || best >= N - 1 || best_v < 3.F)
+        return false;
+      const float y0 = prof[best - 1], y1 = prof[best], y2 = prof[best + 1];
+      const float den = y0 - 2.F * y1 + y2;
+      const float delta = (std::abs(den) < 1e-6F) ? 0.F : 0.5F * (y0 - y2) / den;
+      const float t = static_cast<float>(best - radius) + std::clamp(delta, -0.5F, 0.5F);
+      out = seed + nrm * t;
+      return true;
+    }
+    // (vx,vy,x0,y0) -> ax+by+c=0
+    cv::Vec3f line_abc(const cv::Vec4f &l)
+    {
+      const float vx = l[0], vy = l[1], x0 = l[2], y0 = l[3];
+      return cv::Vec3f(-vy, vx, -(vx * y0 - vy * x0));
+    }
+    bool intersect_abc(const cv::Vec3f &l1, const cv::Vec3f &l2, cv::Point2f &p)
+    {
+      const float d = l1[0] * l2[1] - l1[1] * l2[0];
+      if (std::abs(d) < 1e-6F)
+        return false;
+      p.x = (l1[1] * l2[2] - l1[2] * l2[1]) / d;
+      p.y = (l1[2] * l2[0] - l1[0] * l2[2]) / d;
+      return true;
+    }
+  }
+
+  void lesson03_refine_quad_lines(const cv::Mat &image,
+                                  std::vector<Detection> &detections,
+                                  int pts_per_edge,
+                                  float max_shift)
+  {
+    if (image.empty() || detections.empty())
+      return;
+
+    cv::Mat gray;
+    cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+
+    const int per_edge = std::max(6, pts_per_edge);
+
+    for (auto &d : detections)
+    {
+      float min_side = 1e9F;
+      for (int i = 0; i < 4; ++i)
+        min_side = std::min(min_side, static_cast<float>(cv::norm(d.corners[(i + 1) % 4] - d.corners[i])));
+      const int radius = std::max(2, static_cast<int>(std::round(min_side * 0.04F)));
+      if (min_side < 8.F)
+        continue;
+
+      cv::Vec3f lines[4];
+      bool ok = true;
+      for (int e = 0; e < 4; ++e)
+      {
+        const cv::Point2f a = d.corners[e];
+        const cv::Point2f b = d.corners[(e + 1) % 4];
+        const cv::Point2f dir = b - a;
+        const float len = static_cast<float>(cv::norm(dir));
+        if (len < 6.F)
+        {
+          ok = false;
+          break;
+        }
+        const cv::Point2f u = dir / len;
+        const cv::Point2f nrm(-u.y, u.x);
+
+        std::vector<cv::Point2f> pts;
+        for (int i = 1; i <= per_edge; ++i)
+        {
+          const float t = 0.15F + 0.70F * static_cast<float>(i) / (per_edge + 1);
+          cv::Point2f sp;
+          if (edge_point_1d(gray, a + u * (len * t), nrm, radius, sp))
+            pts.push_back(sp);
+        }
+        if (pts.size() < 5)
+        {
+          ok = false;
+          break;
+        }
+        cv::Vec4f ln;
+        cv::fitLine(pts, ln, cv::DIST_L2, 0, 0.01, 0.01);
+        lines[e] = line_abc(ln);
+      }
+      if (!ok)
+        continue;
+
+      std::array<cv::Point2f, 4> cand{};
+      bool ok2 = true;
+      for (int i = 0; i < 4; ++i)
+        if (!intersect_abc(lines[(i + 3) % 4], lines[i], cand[i]))
+          ok2 = false;
+      if (!ok2)
+        continue;
+
+      float shift = 0.F;
+      for (int i = 0; i < 4; ++i)
+        shift = std::max(shift, static_cast<float>(cv::norm(cand[i] - d.corners[i])));
+      if (shift > max_shift || !quad_is_convex(cand))
+        continue;
+
+      d.corners = cand;
+    }
+  }
+
+  std::optional<cv::Point2f> lesson03_phase_shift(const cv::Mat &prev,
+                                                  const cv::Mat &cur,
+                                                  cv::Rect roi,
+                                                  double min_response)
+  {
+    if (prev.empty() || cur.empty())
+      return std::nullopt;
+
+    roi &= cv::Rect(0, 0, std::min(prev.cols, cur.cols), std::min(prev.rows, cur.rows));
+    if (roi.width < 16 || roi.height < 16)
+      return std::nullopt;
+
+    cv::Mat g1, g2;
+    if (prev.channels() == 3)
+      cv::cvtColor(prev, g1, cv::COLOR_BGR2GRAY);
+    else
+      g1 = prev;
+    if (cur.channels() == 3)
+      cv::cvtColor(cur, g2, cv::COLOR_BGR2GRAY);
+    else
+      g2 = cur;
+
+    cv::Mat a = g1(roi).clone(), b = g2(roi).clone();
+    a.convertTo(a, CV_32F);
+    b.convertTo(b, CV_32F);
+
+    cv::Mat hann;
+    cv::createHanningWindow(hann, a.size(), CV_32F);
+
+    double response = 0.0;
+    const cv::Point2d shift = cv::phaseCorrelate(a, b, hann, &response);
+    if (response < min_response)
+      return std::nullopt;
+
+    return cv::Point2f(static_cast<float>(shift.x), static_cast<float>(shift.y));
   }
 
 } // namespace training

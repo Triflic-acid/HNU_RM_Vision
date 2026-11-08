@@ -25,6 +25,8 @@ add_library(training_lessons lessons/lesson02_io.cpp
  lessons/lesson03_detection.cpp lessons/lesson04_tracking.cpp
  lessons/lesson05_aiming.cpp)
 
+target_compile_options(training_lessons PRIVATE -Wall -Wextra) #编译选项
+
 set(ONNXRUNTIME_ROOT "${CMAKE_SOURCE_DIR}/third_party/onnxruntime")
 
 target_include_directories(training_lessons PRIVATE ${ONNXRUNTIME_ROOT}/include)

@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <algorithm>
 
 namespace
 {
@@ -99,6 +100,32 @@ namespace
   }
 
   constexpr bool kDemoWrite{false}; // write()函数测试开关
+
+  enum class RoiMode
+  {
+    kOff,
+    kAuto,
+    kManual
+  };
+  enum class RefineMode
+  {
+    kOff,
+    kSubpix,
+    kLines
+  };
+
+  const char *refine_name(RefineMode m)
+  {
+    switch (m)
+    {
+    case RefineMode::kSubpix:
+      return "subpix";
+    case RefineMode::kLines:
+      return "lines";
+    default:
+      return "off";
+    }
+  }
 }
 
 int main(int argc, char **argv)
@@ -113,6 +140,12 @@ int main(int argc, char **argv)
 
   training::DetMode mode{training::DetMode::kArmor}; // 默认自瞄；按 m 切换
 
+  RoiMode roi_mode = RoiMode::kOff;
+  const float manual_zoom = 2.0F;
+  RefineMode refine_mode = RefineMode::kOff;
+  const int subpix_win = 5;
+  double last_ms = 0.0;
+
   while (!interrupted)
   {
     const auto input = devices.read();
@@ -123,7 +156,54 @@ int main(int argc, char **argv)
 
     if (input)
     {
-      detections = training::lesson03_detection(input->image, mode);
+
+      // 为ROI预留
+      const auto t0 = std::chrono::steady_clock::now();
+
+      bool used_roi = false;
+      if (roi_mode == RoiMode::kAuto)
+      {
+        const float w_m = (mode == training::DetMode::kArmor) ? 0.225F : 0.0F;
+        const auto plan = training::lesson04_roi_plan(
+            tracking, calibration, input->image.cols, input->image.rows, w_m);
+        if (plan.use)
+        {
+          detections = training::lesson03_detection_roi(
+              input->image, plan.center,
+              static_cast<float>(input->image.cols) / plan.side, mode);
+          used_roi = true;
+        }
+      }
+      else if (roi_mode == RoiMode::kManual)
+      {
+        const cv::Point2f c = (tracking.last_center.x >= 0.F)
+                                  ? tracking.last_center
+                                  : cv::Point2f(input->image.cols * 0.5F, input->image.rows * 0.5F);
+        detections = training::lesson03_detection_roi(input->image, c, manual_zoom, mode);
+        used_roi = true;
+      }
+
+      if (!used_roi)
+        detections = training::lesson03_detection(input->image, mode);
+
+      // 亚像素精修
+      if (!detections.empty())
+      {
+        if (refine_mode == RefineMode::kSubpix)
+          training::lesson03_refine_subpix(input->image, detections, subpix_win);
+        else if (refine_mode == RefineMode::kLines)
+          training::lesson03_refine_quad_lines(input->image, detections);
+      }
+
+      // 计时
+      last_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+      // 写回
+      // 状态只由 lesson4 更新
+      // main 不直接写入 TrackingState 字段
+      training::lesson04_observe(tracking, detections);
+
+      // lesson 4/5 目标跟踪/击打
       const auto target = training::lesson04_tracking(
           detections, mode, input->timestamp, input->imu_q, calibration, tracking);
       if (target)
@@ -149,7 +229,7 @@ int main(int argc, char **argv)
 
     if (devices.config.display)
     {
-      // 没有新帧时也应当刷新窗口，否则窗口会假死、按键无响应
+      // 没有新帧时也刷新窗口，否则窗口会假死、按键无响应
       cv::Mat canvas;
       if (input)
       {
@@ -167,13 +247,14 @@ int main(int argc, char **argv)
       }
 
       {
-        char hud[160];
-        if (mode == training::DetMode::kArmor)
-          std::snprintf(hud, sizeof(hud), "[MODE] ARMOR   %zu targets    (m: switch)",
-                        detections.size());
-        else
-          std::snprintf(hud, sizeof(hud), "[MODE] RUNE    %zu blades   logo:%s    (m: switch)",
-                        detections.size(), has_logo ? "Y" : "N");
+        const char *roi_txt = (roi_mode == RoiMode::kAuto)     ? "auto"
+                              : (roi_mode == RoiMode::kManual) ? "manual"
+                                                               : "off";
+        char hud[200];
+        std::snprintf(hud, sizeof(hud),
+                      "[%s] %zu targets  %.1fms  ROI:%s  refine:%s  m:mode z:roi p:refine",
+                      mode == training::DetMode::kArmor ? "ARMOR" : "RUNE",
+                      detections.size(), last_ms, roi_txt, refine_name(refine_mode));
         cv::putText(canvas, hud, cv::Point(12, 26), cv::FONT_HERSHEY_SIMPLEX, 0.65,
                     mode == training::DetMode::kArmor ? cv::Scalar(0, 255, 0)
                                                       : cv::Scalar(0, 128, 255),
@@ -189,8 +270,24 @@ int main(int argc, char **argv)
         mode = (mode == training::DetMode::kArmor) ? training::DetMode::kRune
                                                    : training::DetMode::kArmor;
         tracking = training::TrackingState{};
-        std::printf("[gui] 切换到 %s 模式\n",
-                    mode == training::DetMode::kArmor ? "自瞄(ARMOR)" : "打符(RUNE)");
+      }
+      else if (key == 'z' || key == 'Z')
+      {
+        roi_mode = (roi_mode == RoiMode::kOff)    ? RoiMode::kAuto
+                   : (roi_mode == RoiMode::kAuto) ? RoiMode::kManual
+                                                  : RoiMode::kOff;
+        std::printf("[gui] ROI: %s\n",
+                    roi_mode == RoiMode::kAuto     ? "自动(PnP)"
+                    : roi_mode == RoiMode::kManual ? "手动 2.0x"
+                                                   : "关闭");
+        std::fflush(stdout);
+      }
+      else if (key == 'p' || key == 'P')
+      {
+        refine_mode = (refine_mode == RefineMode::kOff)      ? RefineMode::kSubpix
+                      : (refine_mode == RefineMode::kSubpix) ? RefineMode::kLines
+                                                             : RefineMode::kOff;
+        std::printf("[gui] 精修: %s\n", refine_name(refine_mode));
         std::fflush(stdout);
       }
     }

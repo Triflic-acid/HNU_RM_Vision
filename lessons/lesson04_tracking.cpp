@@ -46,4 +46,65 @@ namespace training
     return std::nullopt;
     // ===== 实现区 END =====
   }
+
+  // 由 lesson3 的观测更新跨帧状态
+  // main 不直接写入 TrackingState 字段
+  void lesson04_observe(TrackingState &state, const std::vector<Detection> &detections)
+  {
+    if (detections.empty())
+    {
+      state.lost_frames += 1;
+      return;
+    }
+    state.lost_frames = 0;
+    const Detection &d = detections.front();
+    state.last_center = (d.corners[0] + d.corners[1] + d.corners[2] + d.corners[3]) * 0.25F;
+    state.last_box_px = std::max(d.box.width, d.box.height);
+  }
+
+  RoiPlan lesson04_roi_plan(const TrackingState &state,
+                            const CameraCalibration &calibration,
+                            int img_width, int img_height,
+                            float target_width_m)
+  {
+    RoiPlan plan;
+    if (img_width <= 0 || img_height <= 0)
+      return plan;
+    const int short_side = std::min(img_width, img_height);
+    // ① 预期像素尺寸：优先用 PnP 距离，退化为上一帧框宽
+    float pred_px = 0.F;
+    if (state.last_distance_m > 0.1 && target_width_m > 1e-4F && calibration.valid())
+    {
+      const double fx = calibration.matrix.at<double>(0, 0);
+      pred_px = static_cast<float>(fx * target_width_m / state.last_distance_m);
+    }
+    else if (state.last_box_px > 4.F)
+    {
+      pred_px = state.last_box_px;
+    }
+    else
+    {
+      return plan; // 没有任何先验，本帧走全图
+    }
+    // ② 目标太大（离得太近）就不裁，直接全图
+    //    经验阈值：目标超过短边的 45%，裁剪很容易切掉一部分
+    if (pred_px > 0.45F * static_cast<float>(short_side))
+      return plan;
+    // ③ 裁剪边长 = 2.5 倍目标尺寸，且不小于 128，不大于短边
+    float side = std::clamp(2.5F * pred_px, 128.F, static_cast<float>(short_side));
+    if (side >= 0.95F * static_cast<float>(short_side))
+      return plan;
+    // ④ 中心：优先用上一帧目标中心，否则画面中心
+    cv::Point2f c = state.last_center;
+    if (c.x < 0.F || c.y < 0.F)
+      c = cv::Point2f(img_width * 0.5F, img_height * 0.5F);
+    // ⑤ 裁剪框贴边时把中心拉回画面内
+    const float half = side * 0.5F;
+    c.x = std::clamp(c.x, half, static_cast<float>(img_width) - half);
+    c.y = std::clamp(c.y, half, static_cast<float>(img_height) - half);
+    plan.use = true;
+    plan.center = c;
+    plan.side = side;
+    return plan;
+  }
 } // namespace training

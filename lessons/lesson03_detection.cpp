@@ -67,15 +67,15 @@ namespace training
         {3, false}, // B3 步兵
         {4, false}, // B4 步兵
         {5, false}, // B5 步兵
-        {6, false}, // BO 前哨站
-        {0, false}, // BS 哨兵
+        {0, false}, // BO 前哨站
+        {7, false}, // BS 哨兵
         {1, true},  // R1 英雄（大板）
         {2, false}, // R2 工程
         {3, false}, // R3 步兵
         {4, false}, // R4 步兵
         {5, false}, // R5 步兵
-        {6, false}, // RO 前哨站
-        {0, false}, // RS 哨兵
+        {0, false}, // RO 前哨站
+        {7, false}, // RS 哨兵
     };
 
     const char *model_path(DetMode mode)

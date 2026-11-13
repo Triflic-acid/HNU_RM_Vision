@@ -43,7 +43,7 @@ struct Detection {
   int class_id = -1;        // 装甲板：编号 0~6；符文：恒为 0
   bool large_armor = false; // 仅装甲板有效（大板 225x125 / 小板 135x125）
   double confidence = 0;
-  // 仅符文有效：R 标圆心（模板匹配得到，全帧共享）。
+  // 仅对能量机关有效：R 标圆心（模板匹配得到，全帧共享）。
   // 为什么不让网络回归：圆心距叶片约 260 px，网络预测会塌到叶片附近，
   // 把 Pose mAP50-95 从 0.995 压到 0.597。
   std::optional<cv::Point2f> center;

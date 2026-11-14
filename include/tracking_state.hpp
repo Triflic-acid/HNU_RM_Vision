@@ -35,6 +35,10 @@ namespace training
     float target_box_px{0.0F};           // 最近一次目标在图像里的框宽，作为 PnP 不可用时的退化依据
     int selected_idx{-1};                // 选中目标的id
 
+    // PnP 解算出的上一帧的姿态（用于 IPPE 双解消歧）
+    cv::Vec3d last_rvec{0, 0, 0};
+    bool has_rvec{false};
+    
     // Kalman
     KalmanCV kf;
     TimePoint last_stamp{};

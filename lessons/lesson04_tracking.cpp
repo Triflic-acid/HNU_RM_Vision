@@ -101,8 +101,13 @@ namespace training
       return s / static_cast<double>(proj.size());
     }
     // 对单块板做PnP：返回是否成功
-    bool solve_armor(const Detection &d, const CameraCalibration &cal,
-                     cv::Vec3d &rvec, cv::Vec3d &tvec, double &err_px)
+    bool solve_armor(const Detection &d,
+                     const CameraCalibration &cal,
+                     const cv::Vec3d &rvec_prev,
+                     bool has_prev,
+                     cv::Vec3d &rvec,
+                     cv::Vec3d &tvec,
+                     double &err_px)
     {
       const auto obj = object_points(d.large_armor);
       std::vector<cv::Point2f> img(d.corners.begin(), d.corners.end());
@@ -119,19 +124,50 @@ namespace training
       }
       if (rvecs.empty())
         return false;
-      double best = 1e9;
+      double best{1e9};
+      bool found{false};
+
       for (size_t i = 0; i < rvecs.size(); ++i)
       {
-        if (tvecs[i][2] <= 0.0) // 必须在相机前方（排除镜像解）
+        if (tvecs[i][2] <= 0.0)
           continue;
+
+        // 1. 板面法向必须朝向相机：镜像解的法向背对相机
+        cv::Mat R;
+        cv::Rodrigues(rvecs[i], R);
+        const Eigen::Vector3d n(R.at<double>(0, 2), R.at<double>(1, 2), R.at<double>(2, 2));
+        const Eigen::Vector3d to_cam(-tvecs[i][0], -tvecs[i][1], -tvecs[i][2]);
+        if (n.dot(to_cam) <= 0.0)
+          continue;
+
+        // 2. 重投影合格
         const double e = reproj_error(obj, img, rvecs[i], tvecs[i], K, D);
-        if (e < best)
+        if (e > kMaxReprojPx)
+          continue;
+
+        // 3. 两解都合法，通过计算与上一帧法向量夹角的差值判断
+        double cost = e;
+        if (has_prev)
         {
-          best = e;
+          cv::Mat R_prev;
+          cv::Rodrigues(rvec_prev, R_prev);
+          const Eigen::Vector3d n_prev(R_prev.at<double>(0, 2),
+                                       R_prev.at<double>(1, 2),
+                                       R_prev.at<double>(2, 2));
+          cost += 5.0 * (1.0 - std::clamp(n.dot(n_prev), -1.0, 1.0));
+        }
+
+        if (cost < best)
+        {
+          best = cost;
           rvec = rvecs[i];
           tvec = tvecs[i];
+          found = true;
         }
       }
+
+      if (!found)
+        return false;
       if (best > kMaxReprojPx)
         return false;
       err_px = best;
@@ -227,8 +263,12 @@ namespace training
     // 2. PnP解算
     cv::Vec3d rvec, tvec;
     double err_px{0.0};
-    if (!solve_armor(d, calibration, rvec, tvec, err_px))
+    if (!solve_armor(d, calibration, state.last_rvec, state.has_rvec,
+                     rvec, tvec, err_px))
       return degrade(); // PnP 失败返回本帧无有效观测
+
+    state.last_rvec = rvec;
+    state.has_rvec = true;
 
     // 3. 坐标变换
     const Eigen::Vector3d p_cam(tvec[0], tvec[1], tvec[2]);

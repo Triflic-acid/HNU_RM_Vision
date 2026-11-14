@@ -177,23 +177,29 @@ namespace training
     if (mode != DetMode::kArmor)
       return std::nullopt;
 
-    if (calibration.matrix.empty() || detections.empty())
+    // 本帧没有有效观测时的统一降级（检测为空/PnP 失败）
+    const auto degrade = [&state]() -> std::optional<Target>
     {
-      // 无观测 -> 状态机降级
-      if (state.phase == TrackingState::Phase::kTracking)
+      if (state.phase == TrackingState::Phase::kTracking ||
+          state.phase == TrackingState::Phase::kTempLost)
       {
         if (++state.lost_frames > kTempLostMax)
           state.phase = TrackingState::Phase::kLost;
         else
           state.phase = TrackingState::Phase::kTempLost;
       }
-      else if (state.phase != TrackingState::Phase::kLost)
+      else
       {
         state.phase = TrackingState::Phase::kLost;
         state.same_target_frames = 0;
       }
+      state.has_pred = false;
       return std::nullopt;
-    }
+    };
+
+    // 空结果降级
+    if (calibration.matrix.empty() || detections.empty())
+      return degrade();
 
     // 1. 筛选：通过二维框宽估测的距离筛选
     const double fx{calibration.matrix.at<double>(0, 0)};
@@ -222,9 +228,7 @@ namespace training
     cv::Vec3d rvec, tvec;
     double err_px{0.0};
     if (!solve_armor(d, calibration, rvec, tvec, err_px))
-    {
-      return std::nullopt;
-    }
+      return degrade(); // PnP 失败返回本帧无有效观测
 
     // 3. 坐标变换
     const Eigen::Vector3d p_cam(tvec[0], tvec[1], tvec[2]);

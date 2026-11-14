@@ -8,4 +8,7 @@ namespace training::dbg
     extern bool gui;  // [gui] 按键切换提示
 
     extern bool demo_write; // 演示：无视算法输出，向云台发出按正弦函数运动的指令
+
+    extern bool truth;    // 返回仿真器数据，严禁在实车上开启
+    extern bool pred_log; // 输出预测值 & 真实值日志（真实值依赖 truth）
 } // namespace training::dbg

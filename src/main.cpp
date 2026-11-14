@@ -2,6 +2,7 @@
 #include "io_context.hpp"
 
 #include "debug_flags.hpp"
+#include "talos_truth.hpp"
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
@@ -13,6 +14,8 @@
 #include <cmath>
 #include <algorithm>
 #include <optional>
+#include <deque>
+#include <fstream>
 
 namespace
 {
@@ -52,6 +55,21 @@ namespace
       std::snprintf(text, sizeof(text), "id=%d %.2f", d.class_id, d.confidence);
       draw_quad(canvas, d.corners, cv::Scalar(0, 255, 0), cv::Scalar(0, 0, 255), text);
     }
+  }
+
+  // 250 ms 后的预测框（黄色）
+  void draw_prediction(cv::Mat &canvas, const training::TrackingState &st)
+  {
+    if (!st.has_pred)
+      return;
+
+    for (int i = 0; i < 4; ++i)
+      cv::line(canvas, st.pred_corners[i], st.pred_corners[(i + 1) % 4],
+               cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+
+    cv::putText(canvas, "pred 250ms",
+                cv::Point(cvRound(st.pred_corners[0].x), cvRound(st.pred_corners[0].y) - 8),
+                cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
   }
 
   // 打符：叶片四角 + 靶心 + 圆心
@@ -102,8 +120,8 @@ namespace
     }
   }
 
-  // 圆心时序滤波：在【原图坐标】里做，避免与 ROI 裁剪坐标混用。
-  // 连续 kEscape 次都判为"跳变"就认为旧值错了，接受新值（否则会永久锁死）。
+  // 圆心时序滤波：在原图坐标里做，避免与 ROI 裁剪坐标混用
+  // 连续 kEscape 次都判为"跳变"就认为旧值错了，接受新值（否则会永久锁死）
   struct RuneCenterFilter
   {
     static constexpr int kLostMax{3};
@@ -117,7 +135,7 @@ namespace
     {
       if (in)
       {
-        if (last.x >= 0.F && cv::norm(*in - last) > limit)
+        if (last.x >= 0.0F && cv::norm(*in - last) > limit)
         {
           if (++rejects < kEscape)
             return last;
@@ -131,16 +149,16 @@ namespace
         lost = 0;
         return last;
       }
-      if (last.x >= 0.F && ++lost <= kLostMax)
+      if (last.x >= 0.0F && ++lost <= kLostMax)
         return last;
-      last = cv::Point2f(-1.F, -1.F);
+      last = cv::Point2f(-1.0F, -1.0F);
       lost = 0;
       return std::nullopt;
     }
 
     void reset()
     {
-      last = cv::Point2f(-1.F, -1.F);
+      last = cv::Point2f(-1.0F, -1.0F);
       lost = 0;
       rejects = 0;
     }
@@ -171,20 +189,121 @@ namespace
       return "off";
     }
   }
+  // 左下角：预测误差 + 距离 + 状态
+  void draw_error_panel(cv::Mat &canvas, const training::TrackingState &st)
+  {
+    char line1[160];
+    char line2[160];
+
+    if (st.has_pred_err)
+      std::snprintf(line1, sizeof(line1), "pred_err(250ms) = %6.1f mm", st.pred_err_mm);
+    else
+      std::snprintf(line1, sizeof(line1), "pred_err(250ms) =    ---");
+
+    const char *ph = (st.phase == training::TrackingState::Phase::kTracking)    ? "TRACK"
+                     : (st.phase == training::TrackingState::Phase::kDetecting) ? "DETECT"
+                     : (st.phase == training::TrackingState::Phase::kTempLost)  ? "TEMP_LOST"
+                                                                                : "LOST";
+
+    std::snprintf(line2, sizeof(line2), "dist=%5.2f m  reproj=%4.1f px  %s",
+                  st.distance_m, st.reproj_err_px, ph);
+
+    const int y = canvas.rows - 46;
+    cv::putText(canvas, line1, cv::Point(12, y),
+                cv::FONT_HERSHEY_SIMPLEX, 0.62, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+    cv::putText(canvas, line2, cv::Point(12, y + 26),
+                cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(220, 220, 220), 2, cv::LINE_AA);
+  }
 }
 
+// 真值采样：按预测的目标时刻回查
+struct TruthSample
+{
+  training::TimePoint t;
+  Eigen::Vector3d p;
+  float yaw{0.F};
+  int label{0};
+};
+constexpr double kBaselineMm{0.0};
 
+// 预测值 / 真值 CSV 日志
+// 与 dbg::pred_log 配合：关闭时不打开文件、不产生任何 IO
+class PredLog
+{
+public:
+  bool open(const char *path)
+  {
+    fs_.open(path, std::ios::out | std::ios::trunc);
+    if (!fs_.is_open())
+      return false;
+    fs_ << "time_ms,pred_t_ms,px,py,pz,tx,ty,tz,err_mm,label,dist_m,reproj_px,phase\n";
+    return true;
+  }
+
+  void write(const training::TrackingState &st,
+             const Eigen::Vector3d &pred,
+             const Eigen::Vector3d *truth, // nullptr = 没开真值
+             double err_mm, int label,
+             long long now_ms, long long pred_t_ms)
+  {
+    if (!fs_.is_open())
+      return;
+
+    fs_ << now_ms << ',' << pred_t_ms << ','
+        << pred.x() << ',' << pred.y() << ',' << pred.z() << ',';
+
+    if (truth)
+      fs_ << truth->x() << ',' << truth->y() << ',' << truth->z() << ','
+          << err_mm << ',' << label << ',';
+    else
+      fs_ << ",,,NaN,-1,"; // 无真值：留空
+
+    fs_ << st.distance_m << ',' << st.reproj_err_px << ','
+        << phase_name(st.phase) << '\n';
+
+    if (++count_ % 64 == 0)
+      fs_.flush();
+  }
+
+  void close()
+  {
+    if (fs_.is_open())
+    {
+      fs_.flush();
+      fs_.close();
+    }
+  }
+
+private:
+  static const char *phase_name(training::TrackingState::Phase p)
+  {
+    switch (p)
+    {
+    case training::TrackingState::Phase::kTracking:
+      return "TRACK";
+    case training::TrackingState::Phase::kDetecting:
+      return "DETECT";
+    case training::TrackingState::Phase::kTempLost:
+      return "TEMP_LOST";
+    default:
+      return "LOST";
+    }
+  }
+
+  std::ofstream fs_;
+  int count_{0};
+};
 
 namespace training::dbg
 {
-  bool io{true};          // [IO] 帧率/姿态、[read] nullopt、[Write]
-  bool det{false};        // [det] 每帧检测耗时、模型/模板加载
-  bool rune{true};       // [rune] 圆心 r/w、模板分数
-  bool gui{true};         // [gui] 按键切换提示
+  bool io{true};          // [IO]   帧率/姿态、[read] nullopt、[Write]
+  bool det{false};        // [det]  每帧检测耗时、模型/模板加载
+  bool rune{true};        // [rune] 圆心 r/w、模板分数
+  bool gui{true};         // [gui]  按键切换提示
   bool demo_write{false}; // 演示：无视算法输出，向云台发出按正弦函数运动的指令
+  bool truth{true};       // 返回仿真器数据
+  bool pred_log{true};    // 输出预测值 & 真实值日志（依赖 truth）
 } // namespace training::dbg
-
-
 
 int main(int argc, char **argv)
 {
@@ -194,6 +313,16 @@ int main(int argc, char **argv)
   const auto calibration = training::load_calibration(config);
   training::io::IoContext devices{config};
   training::TrackingState tracking;
+
+  training::truth::ShmTruth truth;
+  bool truth_ok{training::dbg::truth && truth.open()};
+  std::vector<training::truth::Target> truth_targets;
+  std::vector<training::truth::Rune> truth_runes;
+  std::deque<TruthSample> truth_hist;
+
+  PredLog pred_log;
+  const bool pred_log_ok{training::dbg::pred_log && pred_log.open("simulation/outputs/pred_log.csv")};
+
   devices.open();
 
   training::DetMode mode{training::DetMode::kArmor}; // 默认自瞄；按 m 切换
@@ -216,7 +345,7 @@ int main(int argc, char **argv)
     if (input)
     {
 
-      // 为ROI预留
+      // ROI
       const auto t0 = std::chrono::steady_clock::now();
 
       bool used_roi = false;
@@ -235,9 +364,10 @@ int main(int argc, char **argv)
       }
       else if (roi_mode == RoiMode::kManual)
       {
-        const cv::Point2f c = (tracking.last_center.x >= 0.F)
-                                  ? tracking.last_center
-                                  : cv::Point2f(input->image.cols * 0.5F, input->image.rows * 0.5F);
+        const cv::Point2f c{(tracking.target_px.x >= 0.F)
+                                ? tracking.target_px
+                                : cv::Point2f(input->image.cols * 0.5F,
+                                              input->image.rows * 0.5F)};
         detections = training::lesson03_detection_roi(input->image, c, manual_zoom, mode);
         used_roi = true;
       }
@@ -254,9 +384,9 @@ int main(int argc, char **argv)
           training::lesson03_refine_quad_lines(input->image, detections);
       }
 
-      // 能量机关圆心：在【原图坐标】里做时序滤波。
+      // 能量机关圆心：在【原图坐标】里做时序滤波
       // lesson03 只负责单帧；若把时序放进 lesson03，ROI 裁剪坐标会和原图坐标混用，
-      // 表现为圆心被锁到画面角落再也回不来。
+      // 表现为圆心被锁到画面角落再也回不来
       if (mode == training::DetMode::kRune && !detections.empty())
       {
         const float w = std::max(detections.front().box.width, 4.F);
@@ -269,6 +399,23 @@ int main(int argc, char **argv)
       // 计时
       last_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
+      // 真值采集，供 250 ms 后按目标时刻回查
+      if (truth_ok)
+      {
+        truth.poll(truth_targets, truth_runes);
+        if (!truth_targets.empty())
+        {
+          truth_hist.push_back({input->timestamp,
+                                Eigen::Vector3d(truth_targets[0].position[0],
+                                                truth_targets[0].position[1],
+                                                truth_targets[0].position[2]),
+                                truth_targets[0].yaw,
+                                static_cast<int>(truth_targets[0].armor_label)});
+          while (truth_hist.size() > 120)
+            truth_hist.pop_front();
+        }
+      }
+
       // 写回
       // 状态只由 lesson4 更新
       // main 不直接写入 TrackingState 字段
@@ -279,6 +426,70 @@ int main(int argc, char **argv)
           detections, mode, input->timestamp, input->imu_q, calibration, tracking);
       if (target)
         command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
+
+      // 250 ms 前对当前状态的预测值与当前测量值的对比
+      //   dbg::truth  开：与真值比，写完整行（仿真器中）
+      //   dbg::truth  关：只记预测值（实车）
+      while (!tracking.pred_hist.empty())
+      {
+        const auto &rec{tracking.pred_hist.front()};
+        const auto age{input->timestamp - rec.t};
+
+        if (age < std::chrono::milliseconds(250))
+          break; // 没到 250 ms
+
+        if (age > std::chrono::milliseconds(310))
+        {
+          tracking.pred_hist.pop_front(); // 丢弃过期样本
+          continue;
+        }
+
+        const auto t_target{rec.t + std::chrono::milliseconds(250)};
+
+        const TruthSample *best{nullptr};
+        double best_dt{1e9};
+        if (truth_ok)
+        {
+          for (const auto &s : truth_hist)
+          {
+            const double dt_ms{std::abs(std::chrono::duration<double, std::milli>(
+                                            s.t - t_target)
+                                            .count())};
+            if (dt_ms < best_dt)
+            {
+              best_dt = dt_ms;
+              best = &s;
+            }
+          }
+          if (best && best_dt >= 40.0)
+            best = nullptr; // 真值离目标时刻太远
+        }
+
+        if (best)
+        {
+          tracking.pred_err_mm = (best->p - rec.p).norm() * 1000.0 - kBaselineMm;
+          tracking.has_pred_err = true;
+        }
+
+        if (pred_log_ok)
+        {
+          const auto ms = [](const training::TimePoint &t)
+          {
+            return static_cast<long long>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t.time_since_epoch())
+                    .count());
+          };
+          pred_log.write(tracking, rec.p,
+                         best ? &best->p : nullptr,
+                         tracking.pred_err_mm,
+                         best ? best->label : -1,
+                         ms(input->timestamp),
+                         ms(t_target));
+        }
+
+        tracking.pred_hist.pop_front();
+      }
 
       if (mode == training::DetMode::kRune && !detections.empty())
         has_logo = detections.front().center.has_value();
@@ -306,9 +517,14 @@ int main(int argc, char **argv)
       {
         canvas = input->image.clone();
         if (mode == training::DetMode::kArmor)
+        {
           draw_armors(canvas, detections);
+          draw_prediction(canvas, tracking);
+        }
         else
+        {
           draw_runes(canvas, detections);
+        }
       }
       else
       {
@@ -331,6 +547,9 @@ int main(int argc, char **argv)
                                                       : cv::Scalar(0, 128, 255),
                     2);
       }
+
+      if (mode == training::DetMode::kArmor)
+        draw_error_panel(canvas, tracking);
 
       cv::imshow("RoboMaster training", canvas);
       const int key = cv::waitKey(1);
@@ -365,5 +584,6 @@ int main(int argc, char **argv)
     }
   }
 
+  pred_log.close();
   devices.close();
 }

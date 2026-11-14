@@ -32,7 +32,7 @@ namespace training
     // 当前目标
     int target_class_id{-1};
     cv::Point2f target_px{-1.0F, -1.0F}; // 上一帧图像的位置（单位：px）
-    float target_box_px{0.0F};
+    float target_box_px{0.0F};           // 最近一次目标在图像里的框宽，作为 PnP 不可用时的退化依据
 
     // Kalman
     KalmanCV kf;
@@ -41,21 +41,17 @@ namespace training
     // 最近一次解算结果（世界系，单位：m）
     Eigen::Vector3d position{Eigen::Vector3d::Zero()};
     Eigen::Vector3d velocity{Eigen::Vector3d::Zero()};
-    double distance_m{0.0};
+    double distance_m{0.0}; // 最近一次解算得到的目标距离，0 表示未测得
     double reproj_err_px{0.0};
 
-    // 最近一次 PnP 得到的目标距离（单位：m）， 0 表示未测得
-    double last_distance_m{0.0};
-    // 最近一次目标在图像里的框宽（单位：px），作为 PnP 不可用时的退化依据
-    float last_box_px{0.0F};
-    // 最近一次目标中心（单位：px）
-    cv::Point2f last_center{-1.0F, -1.0F};
+    // 像素速度（单位：px/s）：用于 ROI 预测，不需要 imu 和外参即可外推
+    cv::Point2f px_velocity{0.0F, 0.0F};
 
     // 预测框及其误差
-    cv::Point2f pred_corners[4] {};
-    bool has_pred {false};
-    double pred_err_mm {0.0};
-    bool has_pred_err {false};
+    cv::Point2f pred_corners[4]{};
+    bool has_pred{false};
+    double pred_err_mm{0.0};
+    bool has_pred_err{false};
 
     // 预测历史
     struct PredSample

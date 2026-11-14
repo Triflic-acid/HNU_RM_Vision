@@ -180,7 +180,7 @@ namespace training::io
     last_frame_stamp_ = stamp;
 
     // 演示用
-    frame_count_++;
+    ++frame_count_;
     const auto now = Clock::now();
     if (now >= next_log_)
     {

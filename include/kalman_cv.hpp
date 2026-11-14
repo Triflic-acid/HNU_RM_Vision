@@ -46,6 +46,7 @@ namespace training
                 return;
             Mat6 F = Mat6::Identity();
             F.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity() * dt;
+            
             // 离散白噪声加速度模型
             const double q = q_accel_ * q_accel_;
             Mat6 Q = Mat6::Zero();

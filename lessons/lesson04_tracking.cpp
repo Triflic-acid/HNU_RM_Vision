@@ -51,7 +51,7 @@ namespace training
     constexpr int kTempLostMax{10};  // 允许连续丢失10帧
     constexpr double kMaxReprojPx{3.0};
     constexpr double kPredLeadS{0.250}; // 预测250ms后的位置
-    // 用二维框宽估测距离（针孔模型，不做PnP）：
+    // 用二维框宽估测距离（针孔模型，不算PnP）：
     // 像素宽 w = fx * W_real / Z  ->  Z ~ fx * W_real / w
     // 按近似距离排序
     double estimate_distance(const Detection &d, double fx)
@@ -263,30 +263,36 @@ namespace training
     }
 
     state.position = state.kf.position();
-    state.position = state.kf.velocity();
+    state.velocity = state.kf.velocity();
 
     // 非 tracking 模式下不发送目标数据
-    if (state.phase != TrackingState::Phase::kTracking)
+    if (state.phase != TrackingState::Phase::kTracking) 
+    {
+      state.has_pred = false;
       return std::nullopt;
+    }
 
     // 6. 返回预测框 & 250ms历史数据
-    const Eigen::Vector3d p_pred {state.kf.predict_future(kPredLeadS)};
-    const Eigen::Vector3d p_pred_cam {to_camera(p_pred, calibration, imu_q)};
+    const Eigen::Vector3d p_pred{state.kf.predict_future(kPredLeadS)};
+    const Eigen::Vector3d p_pred_cam{to_camera(p_pred, calibration, imu_q)};
     // 此处沿用当前姿态绘制预测框
-    const auto obj {object_points(d.large_armor)};
+    const auto obj{object_points(d.large_armor)};
     std::vector<cv::Point3f> obj_pred;
-    for (const auto &o : obj) {
-      obj_pred.emplace_back(o.x + static_cast<float> (p_pred_cam.x()),
-                            o.y + static_cast<float> (p_pred_cam.y()),
-                            o.z + static_cast<float> (p_pred_cam.z()));
+    for (const auto &o : obj)
+    {
+      obj_pred.emplace_back(o.x + static_cast<float>(p_pred_cam.x()),
+                            o.y + static_cast<float>(p_pred_cam.y()),
+                            o.z + static_cast<float>(p_pred_cam.z()));
     }
     std::vector<cv::Point2f> proj;
-    cv::projectPoints(obj_pred, cv::Vec3d(0,0,0),
-                      cv::Vec3d(p_pred_cam.x(),p_pred_cam.y(),p_pred_cam.z()),
-                      calibration.matrix,calibration.distortion,proj);
-    
-    if (proj.size() == 4) {
-      for (int i{0}; i < 4; ++i) {
+    cv::projectPoints(obj_pred, cv::Vec3d(0, 0, 0),
+                      cv::Vec3d(p_pred_cam.x(), p_pred_cam.y(), p_pred_cam.z()),
+                      calibration.matrix, calibration.distortion, proj);
+
+    if (proj.size() == 4)
+    {
+      for (int i{0}; i < 4; ++i)
+      {
         state.pred_corners[i] = proj[static_cast<size_t>(i)];
       }
       state.has_pred = true;
@@ -299,26 +305,15 @@ namespace training
     }
     Target t;
     t.position = state.position;
-    t.position = state.velocity;
+    t.velocity = state.velocity;
     return t;
-    
+
     // ===== 实现区 END =====
   }
 
   // 由 lesson3 的观测更新跨帧状态
   // main 不直接写入 TrackingState 字段
-  void lesson04_observe(TrackingState &state, const std::vector<Detection> &detections)
-  {
-    if (detections.empty())
-    {
-      state.lost_frames += 1;
-      return;
-    }
-    state.lost_frames = 0;
-    const Detection &d = detections.front();
-    state.last_center = (d.corners[0] + d.corners[1] + d.corners[2] + d.corners[3]) * 0.25F;
-    state.last_box_px = std::max(d.box.width, d.box.height);
-  }
+  void lesson04_observe(TrackingState &state, const std::vector<Detection> &detections) { return; } // 第三讲预留代码，无实际用途，仅为兼容旧骨架，状态更新已统一到 lesson04_tracking()中，请直接忽略本函数
 
   RoiPlan lesson04_roi_plan(const TrackingState &state,
                             const CameraCalibration &calibration,
@@ -329,40 +324,50 @@ namespace training
     if (img_width <= 0 || img_height <= 0)
       return plan;
     const int short_side = std::min(img_width, img_height);
-    // ① 预期像素尺寸：优先用 PnP 距离，退化为上一帧框宽
-    float pred_px = 0.F;
-    if (state.last_distance_m > 0.1 && target_width_m > 1e-4F && calibration.valid())
+    // 1. 预期像素尺寸：优先用 PnP 距离，退化为上一帧框宽
+    float pred_px{0.0F};
+    if (state.distance_m > 0.1 && target_width_m > 1e-4F && calibration.valid())
     {
       const double fx = calibration.matrix.at<double>(0, 0);
-      pred_px = static_cast<float>(fx * target_width_m / state.last_distance_m);
+      pred_px = static_cast<float>(fx * target_width_m / state.distance_m);
     }
-    else if (state.last_box_px > 4.F)
+    else if (state.target_box_px > 4.0F)
     {
-      pred_px = state.last_box_px;
+      pred_px = state.target_box_px;
     }
     else
     {
-      return plan; // 没有任何先验，本帧走全图
+      return plan; // 没有先验时，不作ROI
     }
-    // ② 目标太大（离得太近）就不裁，直接全图
-    //    经验阈值：目标超过短边的 45%，裁剪很容易切掉一部分
-    if (pred_px > 0.45F * static_cast<float>(short_side))
+
+    // 2. 预测本帧的目标位置：ROI 在检测之前算，只能用上一帧状态外推
+    //    延迟 = 一帧间隔（约 28 ms）+ 传输/推理，取 40 ms
+    constexpr float kLatencyS{0.040F}; // 单位 s
+    const cv::Point2f pred_c{state.target_px.x + state.px_velocity.x * kLatencyS,
+                             state.target_px.y + state.px_velocity.y * kLatencyS};
+    const float drift = cv::norm(state.px_velocity) * kLatencyS;
+
+    // 3. 目标太大（太近）/目标太快不裁
+    //    经验阈值：目标超过短边的 45%，容易切掉一部分
+    if (pred_px > 0.45F * static_cast<float>(short_side) || drift > 0.5F * pred_px)
       return plan;
-    // ③ 裁剪边长 = 2.5 倍目标尺寸，且不小于 128，不大于短边
-    float side = std::clamp(2.5F * pred_px, 128.F, static_cast<float>(short_side));
+    // 4. 裁剪边长 = 2.5 倍目标尺寸 + 车子速度造成的外扩
+    const float side{std::clamp(2.5F * pred_px + 2.0F * drift, 128.0F, static_cast<float>(short_side))};
     if (side >= 0.95F * static_cast<float>(short_side))
       return plan;
-    // ④ 中心：优先用上一帧目标中心，否则画面中心
-    cv::Point2f c = state.last_center;
-    if (c.x < 0.F || c.y < 0.F)
+    // 5. 中心：优先预测中心，否则画面中心
+    cv::Point2f c {pred_c};
+    if (c.x < 0.0F || c.y < 0.0F)
       c = cv::Point2f(img_width * 0.5F, img_height * 0.5F);
-    // ⑤ 裁剪框贴边时把中心拉回画面内
+    // 6. 裁剪框贴边时把中心拉回画面内，确保裁减完整
     const float half = side * 0.5F;
     c.x = std::clamp(c.x, half, static_cast<float>(img_width) - half);
     c.y = std::clamp(c.y, half, static_cast<float>(img_height) - half);
+    
     plan.use = true;
     plan.center = c;
     plan.side = side;
+    
     return plan;
   }
 

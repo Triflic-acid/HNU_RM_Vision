@@ -341,7 +341,13 @@ namespace training
       state.has_pred = true;
     }
 
-    state.pred_hist.push_back({timestamp, p_pred});
+    state.pred_hist.push_back({timestamp, p_pred,
+                               d.class_id, d.confidence, d.box.width,
+                               static_cast<float>(state.distance_m),
+                               static_cast<float>(err_px),
+                               state.phase,
+                               state.same_target_frames,
+                               state.lost_frames});
     while (state.pred_hist.size() > 64)
     {
       state.pred_hist.pop_front();

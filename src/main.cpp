@@ -236,30 +236,59 @@ public:
     fs_.open(path, std::ios::out | std::ios::trunc);
     if (!fs_.is_open())
       return false;
-    fs_ << "time_ms,pred_t_ms,px,py,pz,tx,ty,tz,err_mm,label,dist_m,reproj_px,phase\n";
+    fs_ << "time_ms,pred_t_ms,px,py,pz,tx,ty,tz,err_mm,label,"
+           "dist_m,reproj_px,phase,class_id,conf,box_w,same_frames,lost_frames\n";
     return true;
   }
 
-  void write(const training::TrackingState &st,
-             const Eigen::Vector3d &pred,
-             const Eigen::Vector3d *truth, // nullptr = 没开真值
-             double err_mm, int label,
+  void write(const training::TrackingState::PredSample &rec,
+             const Eigen::Vector3d *truth, double err_mm, int label,
              long long now_ms, long long pred_t_ms)
   {
     if (!fs_.is_open())
       return;
 
-    fs_ << now_ms << ',' << pred_t_ms << ','
-        << pred.x() << ',' << pred.y() << ',' << pred.z() << ',';
+    fs_ << now_ms
+        << ','
+        << pred_t_ms
+        << ','
+        << rec.p.x()
+        << ','
+        << rec.p.y()
+        << ','
+        << rec.p.z()
+        << ',';
 
     if (truth)
-      fs_ << truth->x() << ',' << truth->y() << ',' << truth->z() << ','
-          << err_mm << ',' << label << ',';
+      fs_ << truth->x()
+          << ','
+          << truth->y()
+          << ','
+          << truth->z()
+          << ','
+          << err_mm
+          << ','
+          << label
+          << ',';
     else
-      fs_ << ",,,NaN,-1,"; // 无真值：留空
+      fs_ << ",,,NaN,-1,";
 
-    fs_ << st.distance_m << ',' << st.reproj_err_px << ','
-        << phase_name(st.phase) << '\n';
+    fs_ << rec.dist_m
+        << ','
+        << rec.reproj_px
+        << ','
+        << phase_name(rec.phase)
+        << ','
+        << rec.class_id
+        << ','
+        << rec.confidence
+        << ','
+        << rec.box_w
+        << ','
+        << rec.same_frames
+        << ','
+        << rec.lost_frames
+        << '\n';
 
     if (++count_ % 64 == 0)
       fs_.flush();
@@ -313,9 +342,26 @@ public:
     if (!fs_.is_open())
       return;
     const cv::Point2f c{(d.corners[0] + d.corners[1] + d.corners[2] + d.corners[3]) * 0.25F};
-    fs_ << now_ms << ',' << n_det << ',' << idx << ','
-        << d.class_id << ',' << d.confidence << ',' << d.box.width << ','
-        << c.x << ',' << c.y << ',' << est_dist << ',' << (selected ? 1 : 0) << '\n';
+    fs_ << now_ms
+        << ','
+        << n_det
+        << ','
+        << idx
+        << ','
+        << d.class_id
+        << ','
+        << d.confidence
+        << ','
+        << d.box.width
+        << ','
+        << c.x
+        << ','
+        << c.y
+        << ','
+        << est_dist
+        << ','
+        << (selected ? 1 : 0)
+        << '\n';
     if (++count_ % 256 == 0)
       fs_.flush();
   }
@@ -548,7 +594,7 @@ int main(int argc, char **argv)
                     t.time_since_epoch())
                     .count());
           };
-          pred_log.write(tracking, rec.p,
+          pred_log.write(rec,
                          best ? &best->p : nullptr,
                          tracking.pred_err_mm,
                          best ? best->label : -1,

@@ -59,6 +59,18 @@ namespace training
     {
       TimePoint t;       // 时刻
       Eigen::Vector3d p; // 预测坐标（世界系）
+
+      // 探测到的目标（预测帧选中的板）
+      int class_id{-1};
+      float confidence{0.0F};
+      float box_w{0.0F};
+      float dist_m{0.0F};
+      float reproj_px{0.0F};
+
+      // 锁定状态
+      Phase phase{Phase::kLost};
+      int same_frames{0};
+      int lost_frames{0};
     };
     std::deque<PredSample> pred_hist;
   };

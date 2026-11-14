@@ -33,6 +33,7 @@ namespace training
     int target_class_id{-1};
     cv::Point2f target_px{-1.0F, -1.0F}; // 上一帧图像的位置（单位：px）
     float target_box_px{0.0F};           // 最近一次目标在图像里的框宽，作为 PnP 不可用时的退化依据
+    int selected_idx{-1};                // 选中目标的id
 
     // Kalman
     KalmanCV kf;
@@ -57,7 +58,7 @@ namespace training
     struct PredSample
     {
       TimePoint t;       // 时刻
-      Eigen::Vector3d p; // 世界坐标
+      Eigen::Vector3d p; // 预测坐标（世界系）
     };
     std::deque<PredSample> pred_hist;
   };

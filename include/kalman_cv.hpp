@@ -1,5 +1,6 @@
 /*
 匀速卡尔曼滤波模型
+通过距离自适应量测噪声进行了优化
 */
 
 #pragma once
@@ -21,6 +22,18 @@ namespace training
         {
             q_accel_ = q_accel;
             r_pos_ = r_pos;
+            R_ = Eigen::Matrix3d::Identity() * r_pos * r_pos;
+        }
+
+        // 直接给定量测协方差矩阵（世界系，3x3）。
+        //
+        // 单目 PnP 的噪声是**各向异性**的：
+        //   · 横向（垂直于视线）：σ_lat ≈ Z·σ_px/fx          → 2 m 处约 2 mm
+        //   · 深度（沿视线）    ：σ_dep ≈ Z²·σ_px/(fx·W)      → 2 m 处约 80 mm
+        // 深度方向噪声比横向大 40 倍，用标量 r_pos 无法表达。
+        void set_R(const Eigen::Matrix3d &R)
+        {
+            R_ = 0.5 * (R + R.transpose());
         }
         bool initialized() const { return initialized_; }
         void reset()
@@ -35,7 +48,7 @@ namespace training
             x_.setZero();
             x_.head<3>() = p;
             P_.setZero();
-            P_.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * r_pos_ * r_pos_;
+            P_.block<3, 3>(0, 0) = R_;
             P_.block<3, 3>(3, 3) = Eigen::Matrix3d::Identity() * 25.0; // 速度未知
             initialized_ = true;
         }
@@ -69,7 +82,7 @@ namespace training
             }
             Eigen::Matrix<double, 3, 6> H = Eigen::Matrix<double, 3, 6>::Zero();
             H.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
-            Eigen::Matrix3d R = Eigen::Matrix3d::Identity() * r_pos_ * r_pos_;
+            const Eigen::Matrix3d &R = R_;
             const Eigen::Matrix3d S = H * P_ * H.transpose() + R;
             const Eigen::Matrix<double, 6, 3> K = P_ * H.transpose() * S.inverse();
             x_ = x_ + K * (p - H * x_);
@@ -85,6 +98,7 @@ namespace training
         bool initialized_{false};
         double q_accel_{8.0};
         double r_pos_{0.02};
+        Eigen::Matrix3d R_{Eigen::Matrix3d::Identity() * 0.02 * 0.02};
         Vec6 x_{Vec6::Zero()};
         Mat6 P_{Mat6::Identity()};
     };

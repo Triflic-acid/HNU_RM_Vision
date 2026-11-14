@@ -200,15 +200,15 @@ namespace
     else
       std::snprintf(line1, sizeof(line1), "pred_err(250ms) =    ---");
 
-    const char *ph = (st.phase == training::TrackingState::Phase::kTracking)    ? "TRACK"
-                     : (st.phase == training::TrackingState::Phase::kDetecting) ? "DETECT"
-                     : (st.phase == training::TrackingState::Phase::kTempLost)  ? "TEMP_LOST"
-                                                                                : "LOST";
+    const char *ph{(st.phase == training::TrackingState::Phase::kTracking)    ? "TRACK"
+                   : (st.phase == training::TrackingState::Phase::kDetecting) ? "DETECT"
+                   : (st.phase == training::TrackingState::Phase::kTempLost)  ? "TEMP_LOST"
+                                                                              : "LOST"};
 
     std::snprintf(line2, sizeof(line2), "dist=%5.2f m  reproj=%4.1f px  %s",
                   st.distance_m, st.reproj_err_px, ph);
 
-    const int y = canvas.rows - 46;
+    const int y{canvas.rows - 46};
     cv::putText(canvas, line1, cv::Point(12, y),
                 cv::FONT_HERSHEY_SIMPLEX, 0.62, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
     cv::putText(canvas, line2, cv::Point(12, y + 26),
@@ -294,6 +294,46 @@ private:
   int count_{0};
 };
 
+// 每帧每个检测输出一行日志
+class DetLog
+{
+public:
+  bool open(const char *path)
+  {
+    fs_.open(path, std::ios::out | std::ios::trunc);
+    if (!fs_.is_open())
+      return false;
+    fs_ << "time_ms,n_det,idx,class_id,conf,box_w,cx,cy,est_dist,selected\n";
+    return true;
+  }
+
+  void write(long long now_ms, int idx, int n_det,
+             const training::Detection &d, double est_dist, bool selected)
+  {
+    if (!fs_.is_open())
+      return;
+    const cv::Point2f c{(d.corners[0] + d.corners[1] + d.corners[2] + d.corners[3]) * 0.25F};
+    fs_ << now_ms << ',' << n_det << ',' << idx << ','
+        << d.class_id << ',' << d.confidence << ',' << d.box.width << ','
+        << c.x << ',' << c.y << ',' << est_dist << ',' << (selected ? 1 : 0) << '\n';
+    if (++count_ % 256 == 0)
+      fs_.flush();
+  }
+
+  void close()
+  {
+    if (fs_.is_open())
+    {
+      fs_.flush();
+      fs_.close();
+    }
+  }
+
+private:
+  std::ofstream fs_;
+  int count_{0};
+};
+
 namespace training::dbg
 {
   bool io{true};          // [IO]   帧率/姿态、[read] nullopt、[Write]
@@ -322,6 +362,8 @@ int main(int argc, char **argv)
 
   PredLog pred_log;
   const bool pred_log_ok{training::dbg::pred_log && pred_log.open("simulation/outputs/pred_log.csv")};
+  DetLog det_log;
+  const bool det_log_ok{training::dbg::pred_log && det_log.open("det_log.csv")};
 
   devices.open();
 
@@ -384,9 +426,10 @@ int main(int argc, char **argv)
           training::lesson03_refine_quad_lines(input->image, detections);
       }
 
-      // 能量机关圆心：在【原图坐标】里做时序滤波
-      // lesson03 只负责单帧；若把时序放进 lesson03，ROI 裁剪坐标会和原图坐标混用，
-      // 表现为圆心被锁到画面角落再也回不来
+      // 能量机关圆心：在原图坐标里做时序滤波
+      // lesson03 只负责单帧
+      // 若把时序放进 lesson03，ROI 裁剪坐标会和原图坐标混用
+      // 表现为圆心被锁到画面角落无法归位
       if (mode == training::DetMode::kRune && !detections.empty())
       {
         const float w = std::max(detections.front().box.width, 4.F);
@@ -419,13 +462,38 @@ int main(int argc, char **argv)
       // 写回
       // 状态只由 lesson4 更新
       // main 不直接写入 TrackingState 字段
-      training::lesson04_observe(tracking, detections);
+      // lesson4 目标跟踪
+      const auto target{training::lesson04_tracking(detections,
+                                                    mode,
+                                                    input->timestamp,
+                                                    input->imu_q,
+                                                    calibration,
+                                                    tracking)};
 
-      // lesson 4/5 目标跟踪/击打
-      const auto target = training::lesson04_tracking(
-          detections, mode, input->timestamp, input->imu_q, calibration, tracking);
+      // 写入det_log
+      if (det_log_ok)
+      {
+        const long long now_ms{std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   input->timestamp.time_since_epoch())
+                                   .count()};
+        const int n_det{static_cast<int>(detections.size())};
+        for (int i = 0; i < n_det; ++i)
+        {
+          const auto &dd{detections[static_cast<size_t>(i)]};
+          const double est{(calibration.valid() && dd.box.width > 1.F)
+                               ? calibration.matrix.at<double>(0, 0) * (dd.large_armor ? 0.225 : 0.135) / dd.box.width
+                               : 0.0};
+          det_log.write(now_ms, i, n_det, dd, est, /*selected=*/i == tracking.selected_idx);
+        }
+      }
+
+      // lesson5 开火
       if (target)
-        command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
+      {
+        command = training::lesson05_aiming(*target,
+                                            input->timestamp,
+                                            input->bullet_speed);
+      }
 
       // 250 ms 前对当前状态的预测值与当前测量值的对比
       //   dbg::truth  开：与真值比，写完整行（仿真器中）
@@ -585,5 +653,6 @@ int main(int argc, char **argv)
   }
 
   pred_log.close();
+  det_log.close();
   devices.close();
 }

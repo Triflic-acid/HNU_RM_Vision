@@ -51,6 +51,21 @@ namespace training
     constexpr int kTempLostMax{10};  // 允许连续丢失10帧
     constexpr double kMaxReprojPx{3.0};
     constexpr double kPredLeadS{0.250}; // 预测250ms后的位置
+
+    // 噪声量测模型（距离自适应）
+    // 由针孔几何推出：
+    //   深度 Z = fx·W/w   ->  ∂Z/∂w = −Z²/(fx·W)
+    //   横向 X = Z·u/fx   ->  ∂X/∂u = Z/fx
+    // 因此角点像素噪声 σ_px 传播成
+    //   横向 σ_lat = Z·σ_px/fx        （∝ Z）
+    //   深度 σ_dep = Z²·σ_px/(fx·W)   （∝ Z²，且与板宽 W 成反比）
+    // 2 m、小板(135 mm)、σ_px=3 px：σ_lat≈4.6 mm，σ_dep≈82 mm（实测 80 mm）
+    constexpr double kCornerNoisePx{3.0};
+    constexpr double kSigLatMin{0.002};
+    constexpr double kSigLatMax{0.05};
+    constexpr double kSigDepMin{0.01};
+    constexpr double kSigDepMax{0.60};
+
     // 用二维框宽估测距离（针孔模型，不算PnP）：
     // 像素宽 w = fx * W_real / Z  ->  Z ~ fx * W_real / w
     // 按近似距离排序
@@ -199,6 +214,7 @@ namespace training
       return std::nullopt;
     }
 
+    state.selected_idx = best_idx;
     const Detection &d{detections[static_cast<size_t>(best_idx)]};
     const cv::Point2f px{center_of(d.corners.data())};
 
@@ -213,6 +229,33 @@ namespace training
     // 3. 坐标变换
     const Eigen::Vector3d p_cam(tvec[0], tvec[1], tvec[2]);
     const Eigen::Vector3d p_world(to_world(p_cam, calibration, imu_q));
+
+    //   相机系：x/y 横向、z 深度 -> 对角阵
+    //   再旋转到世界系：R_world = M·R_cam·Mᵀ，M = R_g2w·R_c2g
+    {
+      const double fx = calibration.matrix.at<double>(0, 0);
+      const double W = d.large_armor ? kLargeW : kSmallW;
+      const double Z = std::max(p_cam.z(), 0.05); // 用深度，不用模长
+
+      double sig_lat = Z * kCornerNoisePx / fx;
+      double sig_dep = Z * Z * kCornerNoisePx / (fx * W);
+      sig_lat = std::clamp(sig_lat, kSigLatMin, kSigLatMax);
+      sig_dep = std::clamp(sig_dep, kSigDepMin, kSigDepMax);
+
+      Eigen::Matrix3d R_cam = Eigen::Matrix3d::Zero();
+      R_cam(0, 0) = sig_lat * sig_lat;
+      R_cam(1, 1) = sig_lat * sig_lat;
+      R_cam(2, 2) = sig_dep * sig_dep;
+
+      const Eigen::Matrix3d R_c2g =
+          (calibration.camera_to_gimbal.rows() == 3 &&
+           calibration.camera_to_gimbal.cols() == 3)
+              ? calibration.camera_to_gimbal
+              : Eigen::Matrix3d::Identity();
+      const Eigen::Matrix3d M = imu_q.toRotationMatrix() * R_c2g;
+
+      state.kf.set_R(M * R_cam * M.transpose());
+    }
 
     // 4. 选板
     const bool same{(state.target_class_id == d.class_id) &&
@@ -266,7 +309,7 @@ namespace training
     state.velocity = state.kf.velocity();
 
     // 非 tracking 模式下不发送目标数据
-    if (state.phase != TrackingState::Phase::kTracking) 
+    if (state.phase != TrackingState::Phase::kTracking)
     {
       state.has_pred = false;
       return std::nullopt;
@@ -313,8 +356,6 @@ namespace training
 
   // 由 lesson3 的观测更新跨帧状态
   // main 不直接写入 TrackingState 字段
-  void lesson04_observe(TrackingState &state, const std::vector<Detection> &detections) { return; } // 第三讲预留代码，无实际用途，仅为兼容旧骨架，状态更新已统一到 lesson04_tracking()中，请直接忽略本函数
-
   RoiPlan lesson04_roi_plan(const TrackingState &state,
                             const CameraCalibration &calibration,
                             int img_width, int img_height,
@@ -356,18 +397,18 @@ namespace training
     if (side >= 0.95F * static_cast<float>(short_side))
       return plan;
     // 5. 中心：优先预测中心，否则画面中心
-    cv::Point2f c {pred_c};
+    cv::Point2f c{pred_c};
     if (c.x < 0.0F || c.y < 0.0F)
       c = cv::Point2f(img_width * 0.5F, img_height * 0.5F);
     // 6. 裁剪框贴边时把中心拉回画面内，确保裁减完整
     const float half = side * 0.5F;
     c.x = std::clamp(c.x, half, static_cast<float>(img_width) - half);
     c.y = std::clamp(c.y, half, static_cast<float>(img_height) - half);
-    
+
     plan.use = true;
     plan.center = c;
     plan.side = side;
-    
+
     return plan;
   }
 

@@ -16,6 +16,9 @@ namespace training
     public:
         using Vec6 = Eigen::Matrix<double, 6, 1>;
         using Mat6 = Eigen::Matrix<double, 6, 6>;
+        // 目标速度物理上限（m/s）。只有发射弹丸的机器人，8 m/s 已远超实际。
+        static constexpr double kMaxSpeed = 8.0;
+
         // q_accel: 过程噪声（加速度标准差，m/s²），目标机动越剧烈取值越大
         // r_pos  : 量测噪声（PnP 位置标准差，m）
         void configure(double q_accel = 8.0, double r_pos = 0.02)
@@ -27,9 +30,9 @@ namespace training
 
         // 直接给定量测协方差矩阵（世界系，3x3）。
         //
-        // 单目 PnP 的噪声是**各向异性**的：
-        //   · 横向（垂直于视线）：σ_lat ≈ Z·σ_px/fx          → 2 m 处约 2 mm
-        //   · 深度（沿视线）    ：σ_dep ≈ Z²·σ_px/(fx·W)      → 2 m 处约 80 mm
+        // 单目 PnP 的噪声具有各向异性：
+        // 横向（垂直于视线）：σ_lat ≈ Z·σ_px/fx -> 2 m 处约 2 mm
+        // 深度（沿视线）：σ_dep ≈ Z²·σ_px/(fx·W) -> 2 m 处约 80 mm
         // 深度方向噪声比横向大 40 倍，用标量 r_pos 无法表达。
         void set_R(const Eigen::Matrix3d &R)
         {
@@ -59,7 +62,7 @@ namespace training
                 return;
             Mat6 F = Mat6::Identity();
             F.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity() * dt;
-            
+
             // 离散白噪声加速度模型
             const double q = q_accel_ * q_accel_;
             Mat6 Q = Mat6::Zero();
@@ -89,6 +92,12 @@ namespace training
             const Mat6 I = Mat6::Identity();
             P_ = (I - K * H) * P_;
             P_ = 0.5 * (P_ + P_.transpose());
+
+            // 速度钳位：防止偶发坏量测把速度估计推到物理上不可能的值，
+            // 一旦速度错了，predict 会带着位置一路跑飞（实测等效速度出现过 120 m/s）。
+            const double vn = x_.tail<3>().norm();
+            if (vn > kMaxSpeed)
+                x_.tail<3>() *= kMaxSpeed / vn;
         }
         Eigen::Vector3d position() const { return x_.head<3>(); }
         Eigen::Vector3d velocity() const { return x_.tail<3>(); }

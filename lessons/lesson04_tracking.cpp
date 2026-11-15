@@ -52,6 +52,21 @@ namespace training
     constexpr double kMaxReprojPx{3.0};
     constexpr double kPredLeadS{0.250}; // 预测250ms后的位置
 
+    // ---------- 卡尔曼噪声参数 ----------
+    // 关键：configure() 之前从未被调用，滤波器一直用默认 q_accel=8 m/s²，
+    // 意味着每帧速度允许抖动 √(q·dt) ≈ 0.68 m/s，
+    // 预测 250 ms 时被放大成 ±170 mm —— 这就是"静止靶也抖"的根因。
+    constexpr double kQAccel{0.40};   // 加速度标准差 m/s²（机器人实际 <1）
+    constexpr double kRPosInit{0.08}; // 初始量测标准差 m（之后被 set_R 覆盖）
+
+    // 预测位移上限：速度估计有噪声时，0.25 s 外推会把误差放大成米级跳变
+    constexpr double kPredMaxShift{0.80};
+
+    // ---------- 观测有效性门限 ----------
+    constexpr float  kMinBoxPx{40.0F};      // 框宽下限：小于它解算不可信
+    constexpr double kDistRatioMax{1.8};    // PnP 距离 / 单目距离 上限
+    constexpr double kDistRatioMin{0.55};   // 下限
+
     // 噪声量测模型（距离自适应）
     // 由针孔几何推出：
     //   深度 Z = fx·W/w   ->  ∂Z/∂w = −Z²/(fx·W)
@@ -124,9 +139,8 @@ namespace training
       }
       if (rvecs.empty())
         return false;
-      // 暂时关闭双解消歧：只按重投影误差选最小
-      // IPPE 仍返回两个解，但不用法向判据，也不看上一帧
-      // rvec_prev / has_prev 保留但暂时无作用
+      // 暂时关闭双解消歧：只按重投影误差选最小（保留 IPPE 的两个解，但不用法向判据）
+      // 参数 rvec_prev / has_prev 保留是为了不改调用点，当前不参与判定
       (void)rvec_prev;
       (void)has_prev;
 
@@ -147,7 +161,7 @@ namespace training
           best = e;
           rvec = rvecs[i];
           tvec = tvecs[i];
-          found = true; // ← 关键：这行之前丢了
+          found = true;
         }
       }
 
@@ -227,6 +241,11 @@ namespace training
     double best_dist{1e9};
     for (size_t i{0}; i < detections.size(); ++i)
     {
+      // 门 1：框太小时单目距离和 PnP 深度都不可信。
+      // 实测跳变帧的框宽中位 30 px、正常帧 81 px，40 px 正好把两类分开。
+      if (detections[i].box.width < kMinBoxPx)
+        continue;
+
       const double dist{estimate_distance(detections[i], fx)};
       if (dist < best_dist)
       {
@@ -255,6 +274,16 @@ namespace training
 
     // 3. 坐标变换
     const Eigen::Vector3d p_cam(tvec[0], tvec[1], tvec[2]);
+
+    // 门 2：PnP 距离必须与单目估距一致。
+    // 远处小目标（框 30 px）会被解到 16 m，重投影反而更小（0.31 px），
+    // 所以重投影门限拦不住，只能靠两路距离互相校验。
+    {
+      const double d_pnp = p_cam.norm();
+      const double d_mono = estimate_distance(d, fx);
+      if (d_mono > 0.1 && (d_pnp > kDistRatioMax * d_mono || d_pnp < kDistRatioMin * d_mono))
+        return degrade();
+    }
     const Eigen::Vector3d p_world(to_world(p_cam, calibration, imu_q));
 
     //   相机系：x/y 横向、z 深度 -> 对角阵
@@ -285,9 +314,15 @@ namespace training
     }
 
     // 4. 选板
-    const bool same{(state.target_class_id == d.class_id) &&
-                    (state.target_px.x >= 0.0F) &&
-                    (cv::norm(px - state.target_px) < (0.6F * std::max(d.box.width, 8.0F)))};
+    // 编号会抖（实测 310 次换号里 142 次位置几乎没动），所以不能只看 class_id：
+    // 位置极近时视为同一块，即使编号变了。
+    const float px_shift = (state.target_px.x >= 0.0F)
+                               ? static_cast<float>(cv::norm(px - state.target_px))
+                               : 1e9F;
+    const float box_w = std::max(d.box.width, 8.0F);
+    const bool same{(state.target_px.x >= 0.0F) &&
+                    (px_shift < 1.0F * box_w) &&
+                    (state.target_class_id == d.class_id || px_shift < 0.35F * box_w)};
 
     if (same)
       ++state.same_target_frames;
@@ -324,6 +359,7 @@ namespace training
 
     if (!state.kf.initialized())
     {
+      state.kf.configure(kQAccel, kRPosInit);
       state.kf.init(p_world);
     }
     else
@@ -343,7 +379,14 @@ namespace training
     }
 
     // 6. 返回预测框 & 250ms历史数据
-    const Eigen::Vector3d p_pred{state.kf.predict_future(kPredLeadS)};
+    Eigen::Vector3d p_pred{state.kf.predict_future(kPredLeadS)};
+    {
+      // 速度估计不准时，250 ms 外推会把位置放大成米级跳变；限幅后最坏只是"提前量不足"
+      const Eigen::Vector3d shift{p_pred - state.kf.position()};
+      const double n{shift.norm()};
+      if (n > kPredMaxShift)
+        p_pred = state.kf.position() + shift * (kPredMaxShift / n);
+    }
     const Eigen::Vector3d p_pred_cam{to_camera(p_pred, calibration, imu_q)};
     // 此处沿用当前姿态绘制预测框
     const auto obj{object_points(d.large_armor)};
@@ -369,7 +412,7 @@ namespace training
     }
 
     state.pred_hist.push_back({timestamp, p_pred,
-                               d.class_id, d.confidence, d.box.width,
+                               d.class_id, static_cast<float>(d.confidence), d.box.width,
                                static_cast<float>(state.distance_m),
                                static_cast<float>(err_px),
                                state.phase,

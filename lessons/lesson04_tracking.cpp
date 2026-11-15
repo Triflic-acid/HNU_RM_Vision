@@ -124,6 +124,12 @@ namespace training
       }
       if (rvecs.empty())
         return false;
+      // 暂时关闭双解消歧：只按重投影误差选最小
+      // IPPE 仍返回两个解，但不用法向判据，也不看上一帧
+      // rvec_prev / has_prev 保留但暂时无作用
+      (void)rvec_prev;
+      (void)has_prev;
+
       double best{1e9};
       bool found{false};
 
@@ -132,30 +138,20 @@ namespace training
         if (tvecs[i][2] <= 0.0)
           continue;
 
-        // 1. 重投影合格
         const double e = reproj_error(obj, img, rvecs[i], tvecs[i], K, D);
         if (e > kMaxReprojPx)
           continue;
 
-        // 2. 两解都合法时，用与上一帧法向的夹角打破平局
-        double cost = e;
-        if (has_prev)
+        if (e < best)
         {
-          cv::Mat R, R_prev;
-          cv::Rodrigues(rvecs[i], R);
-          cv::Rodrigues(rvec_prev, R_prev);
-          const Eigen::Vector3d n(R.at<double>(0, 2), R.at<double>(1, 2), R.at<double>(2, 2));
-          const Eigen::Vector3d n_prev(R_prev.at<double>(0, 2),
-                                       R_prev.at<double>(1, 2),
-                                       R_prev.at<double>(2, 2));
-          // 用 |n·n_prev|，因为矩形法向的符号本身是任意的
-          cost += 5.0 * (1.0 - std::abs(n.dot(n_prev)));
+          best = e;
+          rvec = rvecs[i];
+          tvec = tvecs[i];
+          found = true; // ← 关键：这行之前丢了
         }
       }
 
       if (!found)
-        return false;
-      if (best > kMaxReprojPx)
         return false;
       err_px = best;
       return true;

@@ -251,7 +251,7 @@ public:
       return false;
     fs_ << "time_ms,pred_t_ms,px,py,pz,tx,ty,tz,err_mm,label,"
            "dist_m,reproj_px,phase,class_id,conf,box_w,same_frames,lost_frames,"
-           "spin_rate,vz\n";
+           "spin_rate,vz,spin_r,spin_on\n";
     return true;
   }
 
@@ -306,6 +306,10 @@ public:
         << rec.spin_rate
         << ','
         << rec.vz
+        << ','
+        << rec.spin_r
+        << ','
+        << rec.spin_on
         << '\n';
 
     if (++count_ % 64 == 0)

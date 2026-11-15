@@ -9,6 +9,7 @@
 #include "kalman_cv.hpp"
 #include "ekf_ctrv.hpp"
 #include "spin_model.hpp"
+#include "ekf_spin.hpp"
 
 namespace training
 {
@@ -34,7 +35,8 @@ namespace training
     // 当前目标
     int target_class_id{-1};
     cv::Point2f target_px{-1.0F, -1.0F}; // 上一帧图像的位置（单位：px）
-    float target_box_px{0.0F};           // 最近一次目标在图像里的框宽，作为 PnP 不可用时的退化依据
+    float target_box_px{0.0F};  // 最近一次目标的框宽（px）
+    float locked_face{0.0F};    // 锁定装甲板的正面度 cos，用于切板死区
     int selected_idx{-1};                // 选中目标的id
 
     // PnP 解算出的上一帧的姿态（用于 IPPE 双解消歧）
@@ -46,7 +48,8 @@ namespace training
     // 旋转目标（小陀螺/前哨站）用 CTRV-EKF：状态含角速度 ω，能描述绕车体中心的圆周运动
     EkfCtrv ekf;
     // 旋转目标模型：中心 + 半径 + 相位 + 角速度，换板不影响中心估计
-    SpinModel spin;
+    SpinModel spin;          // 旧的滑窗圆周模型（保留做对比/兜底）
+    EkfSpin spin_ekf;        // 圆周 EKF：θ 由装甲板 yaw 直接观测，ω 可收敛
     bool spin_active{false};   // 本帧是否用旋转模型出预测
 
     // ---- 对比用：匀速卡尔曼（CV）的结果 ----
@@ -63,6 +66,8 @@ namespace training
     TimePoint prev_q_stamp{};
     double gimbal_rate{0.0};   // rad/s，云台角速度（供日志观察）
     double spin_rate{0.0};     // rad/s，目标自转角速度（EKF 的 ω 状态）
+    // 图像时刻 -> 本帧决策完成的延迟（s）。lesson05 预测时应把它加到飞行时间上。
+    double pipeline_latency_s{0.0};
 
     // 最近一次解算结果（世界系，单位：m）
     Eigen::Vector3d position{Eigen::Vector3d::Zero()};
@@ -98,8 +103,11 @@ namespace training
       int lost_frames{0};
 
       // 运动状态（诊断旋转/上下抖动用）
-      float spin_rate{0.0F};   // rad/s，EKF 的 ω
+      float spin_rate{0.0F};   // rad/s，EKF/圆周模型的 ω
       float vz{0.0F};          // m/s，EKF 的垂直速度
+      float spin_r{0.0F};      // m，圆周模型的半径估计
+      int spin_on{0};          // 1 = 本帧使用圆周模型
+      float latency_ms{0.0F};  // 图像时刻 -> 决策完成的延迟（ms）
     };
     std::deque<PredSample> pred_hist;
   };

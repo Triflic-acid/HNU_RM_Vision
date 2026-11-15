@@ -1,3 +1,8 @@
+/*
+lesson4 实现
+参考同济大学开源项目 sp_vision_35
+*/
+
 #include "lessons.hpp"
 #include "debug_flags.hpp"
 #include "kalman_cv.hpp"
@@ -63,11 +68,33 @@ namespace training
     constexpr double kQTheta{0.05};   // 航向抖动 rad
     constexpr double kQOmega{0.40};   // 角加速度噪声 rad/s²（2.0 时 ω 被噪声带跑）
 
+    // 装甲环半径先验（m）：按编号给。实车需逐车型标定；仿真按模型尺寸填。
+    // 用途：CTRV/圆周模型里 r 的初值；在线估计只在弧覆盖 ≥180° 时才修正它。
+    double armor_ring_prior(int class_id)
+    {
+      switch (class_id)
+      {
+      case 1: return 0.24;   // 英雄
+      case 2: return 0.22;   // 工程
+      case 3:
+      case 4:
+      case 5: return 0.20;   // 步兵
+      case 7: return 0.26;   // 哨兵
+      case 0: return 0.30;   // 前哨站
+      default: return 0.20;
+      }
+    }
+
     // 预测位移上限：速度估计有噪声时，0.25 s 外推会把误差放大成米级跳变
     constexpr double kPredMaxShift{0.80};
 
     // ---------- 观测有效性门限 ----------
     constexpr float  kMinBoxPx{40.0F};      // 框宽下限：小于它解算不可信
+    // 切板死区：新候选正面度必须比锁定板高这么多才切（0.17 ≈ 10°）
+    constexpr double kSwitchDeadZone{0.17};
+    // 旋转 EKF：omega 超过它才认为是旋转靶；装甲板 yaw 的量测噪声
+    constexpr double kSpinOmegaThresh{1.0};   // rad/s
+    constexpr double kAngleSigma{0.20};       // rad
     constexpr double kDistRatioMax{1.8};    // PnP 距离 / 单目距离 上限
     constexpr double kDistRatioMin{0.55};   // 下限
 
@@ -85,20 +112,59 @@ namespace training
     constexpr double kSigDepMin{0.01};
     constexpr double kSigDepMax{0.60};
 
-    // 用二维框宽估测距离（针孔模型，不算PnP）：
-    // 像素宽 w = fx * W_real / Z  ->  Z ~ fx * W_real / w
-    // 按近似距离排序
+    // 用二维框宽估测距离（针孔模型，不需要 PnP）：
+    //   像素宽 w = fx * W / Z  ->  Z ≈ fx * W / w
     double estimate_distance(const Detection &d, double fx)
     {
       const double W = d.large_armor ? kLargeW : kSmallW;
       const double w = std::max(static_cast<double>(d.box.width), 1.0);
       return fx * W / w;
     }
-    // 按距离排序
+
+    // 装甲板"正面度"：≈ cos(法向与视线夹角)
+    //   投影宽度 w = fx·W·cosα / z  →  cosα = w·z /(fx·W)
+    // 吉大的做法是"打最正对的那块板"；这里用同一判据，且不需要 PnP。
+    double frontality(const Detection &d, double fx)
+    {
+      const double W = d.large_armor ? kLargeW : kSmallW;
+      const double z = fx * W / std::max(static_cast<double>(d.box.width), 1.0);
+      return std::clamp(d.box.width * z / (fx * W), 0.0, 1.0);
+    }
+
     cv::Point2f center_of(const cv::Point2f c[4])
     {
       return (c[0] + c[1] + c[2] + c[3]) * 0.25F;
     }
+
+    // 装甲板法向在世界系下的 yaw（rad），并消去 PI 的符号模糊。
+    //
+    // 装甲板是左右对称的，PnP 给出的法向可以整体翻 180 度而不改变重投影，
+    // 直接把 atan2 结果喂进滤波器会让 theta 来回跳 pi，omega 被带飞。
+    // 真实装甲板的法向一定**朝外**（背离车体中心），用它来定符号：
+    //   令 r_hat = (p - C)/|p - C|，若 n·r_hat < 0 则取 -n。
+    double armor_yaw_world(const cv::Vec3d &rvec, const CameraCalibration &cal,
+                           const Eigen::Quaterniond &imu_q,
+                           const Eigen::Vector3d &center,
+                           const Eigen::Vector3d &p_world)
+    {
+      cv::Mat R;
+      cv::Rodrigues(rvec, R);
+      const Eigen::Matrix3d Rc2g =
+          (cal.camera_to_gimbal.rows() == 3 && cal.camera_to_gimbal.cols() == 3)
+              ? cal.camera_to_gimbal
+              : Eigen::Matrix3d::Identity();
+      Eigen::Vector3d n(R.at<double>(0, 2), R.at<double>(1, 2), R.at<double>(2, 2));
+      Eigen::Vector3d nw = imu_q.toRotationMatrix() * Rc2g * n;
+      nw.z() = 0.0;                     // 只用水平分量算 yaw
+
+      const Eigen::Vector3d radial(p_world.x() - center.x(),
+                                   p_world.y() - center.y(), 0.0);
+      if (nw.norm() > 1e-6 && radial.norm() > 1e-6 && nw.dot(radial) < 0.0)
+        nw = -nw;                       // 翻到朝外的那一侧
+
+      return std::atan2(nw.y(), nw.x());
+    }
+
     // 装甲板 4 角（板中心为原点，z=0），顺序与 Detection::corners 一致：
     // 左上、右上、右下、左下
     std::vector<cv::Point3f> object_points(bool large)
@@ -241,59 +307,55 @@ namespace training
     // 1. 筛选：通过二维框宽估测的距离筛选
     const double fx{calibration.matrix.at<double>(0, 0)};
 
-    // 按距离找最近（门 1：框太小时单目距离和 PnP 深度都不可信）
-    int nearest_idx{-1};
-    double nearest_dist{1e9};
+    // 选板：正面度最大者（吉大方案），带死区迟滞避免帧间反复切板。
+    // 门 1：框太小时单目距离和 PnP 深度都不可信，直接跳过。
+    int best_idx{-1};
+    double best_face{-1.0};
     for (size_t i{0}; i < detections.size(); ++i)
     {
       if (detections[i].box.width < kMinBoxPx)
         continue;
-      const double dist{estimate_distance(detections[i], fx)};
-      if (dist < nearest_dist)
+      const double face{frontality(detections[i], fx)};
+      if (face > best_face)
       {
-        nearest_dist = dist;
-        nearest_idx = static_cast<int>(i);
+        best_face = face;
+        best_idx = static_cast<int>(i);
       }
     }
+    if (best_idx < 0)
+      return std::nullopt;
 
-    // 选板迟滞：上一帧的目标还在（位置接近）且不比最近的远 30 cm 以上，就继续打它。
-    // 实测 class_id 抖动 24%，只靠"最近"会每几帧换一次，位置跟着跳几米。
-    int keep_idx{-1};
-    if (state.target_px.x >= 0.0F)
+    // 死区：上一帧锁定的板仍可见时，只有新候选"明显更正对"才切板
+    if (state.target_px.x >= 0.0F && state.locked_face > 0.0F)
     {
-      double best_px{1e9};
       for (size_t i{0}; i < detections.size(); ++i)
       {
         const cv::Point2f c{center_of(detections[i].corners.data())};
         const double dpx{cv::norm(c - state.target_px)};
-        // 同一个目标：位置接近，或编号也相同
-        const bool same_target =
+        const bool same_plate =
             dpx < 1.0 * std::max(detections[i].box.width, 8.0F) ||
             (detections[i].class_id == state.target_class_id &&
              dpx < 2.0 * std::max(detections[i].box.width, 8.0F));
-        if (same_target && dpx < best_px)
+        if (same_plate)
         {
-          best_px = dpx;
-          keep_idx = static_cast<int>(i);
+          const double face{frontality(detections[i], fx)};
+          if (face + kSwitchDeadZone > best_face)   // 没明显更正对 → 保持锁定
+          {
+            best_idx = static_cast<int>(i);
+            best_face = face;
+              }
+          break;
         }
       }
     }
-
-    int best_idx{nearest_idx};
-    if (keep_idx >= 0)
-    {
-      const double keep_dist{estimate_distance(detections[static_cast<size_t>(keep_idx)], fx)};
-      if (keep_dist <= nearest_dist + 0.30)
-        best_idx = keep_idx;
-    }
-    if (best_idx < 0)
-    {
-      return std::nullopt;
-    }
+    state.locked_face = static_cast<float>(best_face);
 
     state.selected_idx = best_idx;
     const Detection &d{detections[static_cast<size_t>(best_idx)]};
     const cv::Point2f px{center_of(d.corners.data())};
+
+    // 注：半径先验现在由 spin_ekf 自己设置（见旋转段 set_prior_radius），
+    // 旧的 SpinModel 已不再参与主链路，这里不再调用它的接口。
 
     // 2. PnP解算
     cv::Vec3d rvec, tvec;
@@ -365,7 +427,7 @@ namespace training
     }
 
     // 4. 选板
-    // 编号会抖（实测 310 次换号里 142 次位置几乎没动），所以不能只看 class_id：
+    // 编号会抖，不能只看 class_id：
     // 位置极近时视为同一块，即使编号变了。
     const float px_shift = (state.target_px.x >= 0.0F)
                                ? static_cast<float>(cv::norm(px - state.target_px))
@@ -407,6 +469,15 @@ namespace training
     if (state.last_stamp.time_since_epoch().count() != 0)
       dt = std::chrono::duration<double>(timestamp - state.last_stamp).count();
     state.last_stamp = timestamp;
+
+    // 流水线延迟：图像时刻 -> 现在（含传输、推理、决策）。
+    // 同济把这类延迟单独列出来（图像传输 + 处理 + 通信 + 控制 ≈15 ms），
+    // 并指出预测时间必须把它们加在飞行时间之外，否则瞄准系统性滞后。
+    {
+      const auto now_tp = std::chrono::steady_clock::now();
+      const double lat = std::chrono::duration<double>(now_tp - timestamp).count();
+      state.pipeline_latency_s = std::clamp(lat, 0.0, 0.5);
+    }
 
     // 用 CTRV-EKF 同时覆盖两种目标：
     //   · 直线平移：ω≈0，退化成匀速模型
@@ -452,18 +523,27 @@ namespace training
     }
 
     // 6. 返回预测框 & 250ms历史数据
-    // 旋转靶：把当前观测喂给圆周模型（换板会跳相位，但中心/半径用中位数抗住）
-    const double t_sec = std::chrono::duration<double>(timestamp.time_since_epoch()).count();
-    state.spin.push(t_sec, p_world);
-    state.spin_active = state.spin.spinning();
-    if (state.spin_active)
+    // 旋转靶：圆周 EKF。关键是把装甲板自身的 yaw 也作为量测（同济 ypda 的 a），
+    // 否则 theta 与 omega 不可区分，omega 永远学不出来（实测停在 0.2~1.3，真值 2.0）。
+    const Eigen::Vector3d c_for_yaw = state.spin_ekf.initialized()
+                                         ? state.spin_ekf.center()
+                                         : p_world;
+    const double plate_yaw = armor_yaw_world(rvec, calibration, imu_q, c_for_yaw, p_world);
+    if (!state.spin_ekf.initialized())
     {
-      state.spin_rate = state.spin.omega();
+      state.spin_ekf.set_prior_radius(armor_ring_prior(d.class_id));
+      state.spin_ekf.init(p_world);
     }
+    state.spin_ekf.predict(dt);
+    state.spin_ekf.update_with_angle(p_world, plate_yaw, kAngleSigma);
 
-    // 旋转时用圆周外推，直线运动时用 EKF 的 CTRV
+    const double w_spin = state.spin_ekf.omega();
+    state.spin_active = std::abs(w_spin) > kSpinOmegaThresh;
+    if (state.spin_active)
+      state.spin_rate = w_spin;
+
     Eigen::Vector3d p_pred = state.spin_active
-                                 ? state.spin.predict(kPredLeadS)
+                                 ? state.spin_ekf.predict_future(kPredLeadS)
                                  : state.ekf.predict_future(kPredLeadS);
     if (!state.spin_active)
     {
@@ -532,7 +612,10 @@ namespace training
                                state.same_target_frames,
                                state.lost_frames,
                                static_cast<float>(state.spin_rate),
-                               static_cast<float>(state.velocity.z())});
+                               static_cast<float>(state.velocity.z()),
+                               static_cast<float>(state.spin_ekf.radius()),
+                               state.spin_active ? 1 : 0,
+                               static_cast<float>(state.pipeline_latency_s * 1000.0)});
     while (state.pred_hist.size() > 64)
     {
       state.pred_hist.pop_front();

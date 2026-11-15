@@ -72,6 +72,19 @@ namespace
                 cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
   }
 
+  // 对比用：匀速卡尔曼(CV)的预测框（品红）。仅 dbg::cv_filter 打开时有内容。
+  void draw_cv_prediction(cv::Mat &canvas, const training::TrackingState &st)
+  {
+    if (!st.cv_has_pred)
+      return;
+    for (int i = 0; i < 4; ++i)
+      cv::line(canvas, st.cv_pred_corners[i], st.cv_pred_corners[(i + 1) % 4],
+               cv::Scalar(255, 0, 255), 2, cv::LINE_AA);
+    cv::putText(canvas, "cv 250ms",
+                cv::Point(cvRound(st.cv_pred_corners[0].x), cvRound(st.cv_pred_corners[0].y) - 24),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
+  }
+
   // 打符：叶片四角 + 靶心 + 圆心
   void draw_runes(cv::Mat &canvas, const std::vector<training::Detection> &dets)
   {
@@ -237,7 +250,8 @@ public:
     if (!fs_.is_open())
       return false;
     fs_ << "time_ms,pred_t_ms,px,py,pz,tx,ty,tz,err_mm,label,"
-           "dist_m,reproj_px,phase,class_id,conf,box_w,same_frames,lost_frames\n";
+           "dist_m,reproj_px,phase,class_id,conf,box_w,same_frames,lost_frames,"
+           "spin_rate,vz\n";
     return true;
   }
 
@@ -288,6 +302,10 @@ public:
         << rec.same_frames
         << ','
         << rec.lost_frames
+        << ','
+        << rec.spin_rate
+        << ','
+        << rec.vz
         << '\n';
 
     if (++count_ % 64 == 0)
@@ -386,6 +404,7 @@ namespace training::dbg
   bool det{false};        // [det]  每帧检测耗时、模型/模板加载
   bool rune{true};        // [rune] 圆心 r/w、模板分数
   bool gui{true};         // [gui]  按键切换提示
+  bool cv_filter{false};  // 对比：同时运行匀速卡尔曼(CV)，画出品红色预测框
   bool demo_write{false}; // 演示：无视算法输出，向云台发出按正弦函数运动的指令
   bool truth{true};       // 返回仿真器数据
   bool pred_log{true};    // 输出预测值 & 真实值日志（依赖 truth）
@@ -634,6 +653,7 @@ int main(int argc, char **argv)
         {
           draw_armors(canvas, detections);
           draw_prediction(canvas, tracking);
+          draw_cv_prediction(canvas, tracking);
         }
         else
         {

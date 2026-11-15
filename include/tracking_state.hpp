@@ -7,6 +7,7 @@
 
 #include "types.hpp"
 #include "kalman_cv.hpp"
+#include "ekf_ctrv.hpp"
 
 namespace training
 {
@@ -41,7 +42,23 @@ namespace training
     
     // Kalman
     KalmanCV kf;
+    // 旋转目标（小陀螺/前哨站）用 CTRV-EKF：状态含角速度 ω，能描述绕车体中心的圆周运动
+    EkfCtrv ekf;
+
+    // ---- 对比用：匀速卡尔曼（CV）的结果 ----
+    // 只在 dbg::cv_filter 打开时更新；关闭时这些字段保持默认值，不参与任何逻辑。
+    Eigen::Vector3d cv_position{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d cv_velocity{Eigen::Vector3d::Zero()};
+    cv::Point2f cv_pred_corners[4]{};
+    bool cv_valid{false};
+    bool cv_has_pred{false};
     TimePoint last_stamp{};
+    // 上一帧云台姿态：用于估计云台角速度（快速转动时放大量测噪声）
+    Eigen::Quaterniond prev_q{Eigen::Quaterniond::Identity()};
+    bool has_prev_q{false};
+    TimePoint prev_q_stamp{};
+    double gimbal_rate{0.0};   // rad/s，云台角速度（供日志观察）
+    double spin_rate{0.0};     // rad/s，目标自转角速度（EKF 的 ω 状态）
 
     // 最近一次解算结果（世界系，单位：m）
     Eigen::Vector3d position{Eigen::Vector3d::Zero()};
@@ -75,6 +92,10 @@ namespace training
       Phase phase{Phase::kLost};
       int same_frames{0};
       int lost_frames{0};
+
+      // 运动状态（诊断旋转/上下抖动用）
+      float spin_rate{0.0F};   // rad/s，EKF 的 ω
+      float vz{0.0F};          // m/s，EKF 的垂直速度
     };
     std::deque<PredSample> pred_hist;
   };

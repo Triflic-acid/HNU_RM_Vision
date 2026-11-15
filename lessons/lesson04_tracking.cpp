@@ -1,4 +1,5 @@
 #include "lessons.hpp"
+#include "debug_flags.hpp"
 #include "kalman_cv.hpp"
 
 #include <opencv2/calib3d.hpp>
@@ -56,8 +57,11 @@ namespace training
     // 关键：configure() 之前从未被调用，滤波器一直用默认 q_accel=8 m/s²，
     // 意味着每帧速度允许抖动 √(q·dt) ≈ 0.68 m/s，
     // 预测 250 ms 时被放大成 ±170 mm —— 这就是"静止靶也抖"的根因。
-    constexpr double kQAccel{0.40};   // 加速度标准差 m/s²（机器人实际 <1）
+    constexpr double kQAccel{0.30};   // 水平加速度标准差 m/s²
     constexpr double kRPosInit{0.08}; // 初始量测标准差 m（之后被 set_R 覆盖）
+    constexpr double kQAccelZ{0.02};  // 垂直加速度噪声（几乎为 0：地面机器人不做垂直机动）
+    constexpr double kQTheta{0.05};   // 航向抖动 rad
+    constexpr double kQOmega{0.40};   // 角加速度噪声 rad/s²（2.0 时 ω 被噪声带跑）
 
     // 预测位移上限：速度估计有噪声时，0.25 s 外推会把误差放大成米级跳变
     constexpr double kPredMaxShift{0.80};
@@ -237,21 +241,50 @@ namespace training
     // 1. 筛选：通过二维框宽估测的距离筛选
     const double fx{calibration.matrix.at<double>(0, 0)};
 
-    int best_idx{-1};
-    double best_dist{1e9};
+    // 按距离找最近（门 1：框太小时单目距离和 PnP 深度都不可信）
+    int nearest_idx{-1};
+    double nearest_dist{1e9};
     for (size_t i{0}; i < detections.size(); ++i)
     {
-      // 门 1：框太小时单目距离和 PnP 深度都不可信。
-      // 实测跳变帧的框宽中位 30 px、正常帧 81 px，40 px 正好把两类分开。
       if (detections[i].box.width < kMinBoxPx)
         continue;
-
       const double dist{estimate_distance(detections[i], fx)};
-      if (dist < best_dist)
+      if (dist < nearest_dist)
       {
-        best_dist = dist;
-        best_idx = static_cast<int>(i);
+        nearest_dist = dist;
+        nearest_idx = static_cast<int>(i);
       }
+    }
+
+    // 选板迟滞：上一帧的目标还在（位置接近）且不比最近的远 30 cm 以上，就继续打它。
+    // 实测 class_id 抖动 24%，只靠"最近"会每几帧换一次，位置跟着跳几米。
+    int keep_idx{-1};
+    if (state.target_px.x >= 0.0F)
+    {
+      double best_px{1e9};
+      for (size_t i{0}; i < detections.size(); ++i)
+      {
+        const cv::Point2f c{center_of(detections[i].corners.data())};
+        const double dpx{cv::norm(c - state.target_px)};
+        // 同一个目标：位置接近，或编号也相同
+        const bool same_target =
+            dpx < 1.0 * std::max(detections[i].box.width, 8.0F) ||
+            (detections[i].class_id == state.target_class_id &&
+             dpx < 2.0 * std::max(detections[i].box.width, 8.0F));
+        if (same_target && dpx < best_px)
+        {
+          best_px = dpx;
+          keep_idx = static_cast<int>(i);
+        }
+      }
+    }
+
+    int best_idx{nearest_idx};
+    if (keep_idx >= 0)
+    {
+      const double keep_dist{estimate_distance(detections[static_cast<size_t>(keep_idx)], fx)};
+      if (keep_dist <= nearest_dist + 0.30)
+        best_idx = keep_idx;
     }
     if (best_idx < 0)
     {
@@ -310,7 +343,25 @@ namespace training
               : Eigen::Matrix3d::Identity();
       const Eigen::Matrix3d M = imu_q.toRotationMatrix() * R_c2g;
 
-      state.kf.set_R(M * R_cam * M.transpose());
+      // 云台快速转动时，imu 四元数与图像时刻不同步，世界系位置会额外摆动。
+      // 用"相对上一帧的转角"放大量测噪声，让滤波器自动降低对这类帧的信任。
+      double inflate = 1.0;
+      if (state.has_prev_q)
+      {
+        const double dq = state.prev_q.angularDistance(imu_q);          // rad，两帧转角
+        const double dtq =
+            std::max(std::chrono::duration<double>(timestamp - state.prev_q_stamp).count(), 1e-3);
+        const double rate = dq / dtq;                                   // rad/s
+        state.gimbal_rate = rate;
+        inflate = 1.0 + std::clamp(rate / 2.0, 0.0, 8.0);               // 2 rad/s 起明显放大
+      }
+      state.prev_q = imu_q;
+      state.prev_q_stamp = timestamp;
+      state.has_prev_q = true;
+
+      if (training::dbg::cv_filter)
+        state.kf.set_R(M * R_cam * M.transpose() * inflate * inflate);
+      state.ekf.set_R(M * R_cam * M.transpose() * inflate * inflate);
     }
 
     // 4. 选板
@@ -357,19 +408,41 @@ namespace training
       dt = std::chrono::duration<double>(timestamp - state.last_stamp).count();
     state.last_stamp = timestamp;
 
-    if (!state.kf.initialized())
+    // 用 CTRV-EKF 同时覆盖两种目标：
+    //   · 直线平移：ω≈0，退化成匀速模型
+    //   · 小陀螺/前哨站：ω 描述绕车体中心的圆周运动（匀速卡尔曼在这里必然跟不上）
+    if (!state.ekf.initialized())
     {
-      state.kf.configure(kQAccel, kRPosInit);
-      state.kf.init(p_world);
+      state.ekf.configure(kQAccel, kQAccelZ, kQTheta, kQOmega, kRPosInit);
+      state.ekf.init(p_world);
     }
     else
     {
-      state.kf.predict(dt);
-      state.kf.update(p_world);
+      state.ekf.predict(dt);
+      state.ekf.update(p_world);
     }
 
-    state.position = state.kf.position();
-    state.velocity = state.kf.velocity();
+    state.position = state.ekf.position();
+    state.velocity = state.ekf.velocity();
+    state.spin_rate = state.ekf.turn_rate();   // rad/s，供日志/诊断
+
+    // ---- 对比开关：同时跑匀速卡尔曼，供离线对比（不影响主链路）----
+    if (training::dbg::cv_filter)
+    {
+      if (!state.kf.initialized())
+      {
+        state.kf.configure(kQAccel, kRPosInit);
+        state.kf.init(p_world);
+      }
+      else
+      {
+        state.kf.predict(dt);
+        state.kf.update(p_world);
+      }
+      state.cv_position = state.kf.position();
+      state.cv_velocity = state.kf.velocity();
+      state.cv_valid = true;
+    }
 
     // 非 tracking 模式下不发送目标数据
     if (state.phase != TrackingState::Phase::kTracking)
@@ -379,13 +452,13 @@ namespace training
     }
 
     // 6. 返回预测框 & 250ms历史数据
-    Eigen::Vector3d p_pred{state.kf.predict_future(kPredLeadS)};
+    Eigen::Vector3d p_pred{state.ekf.predict_future(kPredLeadS)};
     {
       // 速度估计不准时，250 ms 外推会把位置放大成米级跳变；限幅后最坏只是"提前量不足"
-      const Eigen::Vector3d shift{p_pred - state.kf.position()};
+      const Eigen::Vector3d shift{p_pred - state.ekf.position()};
       const double n{shift.norm()};
       if (n > kPredMaxShift)
-        p_pred = state.kf.position() + shift * (kPredMaxShift / n);
+        p_pred = state.ekf.position() + shift * (kPredMaxShift / n);
     }
     const Eigen::Vector3d p_pred_cam{to_camera(p_pred, calibration, imu_q)};
     // 此处沿用当前姿态绘制预测框
@@ -411,13 +484,41 @@ namespace training
       state.has_pred = true;
     }
 
+    // ---- 对比开关：CV 的预测框（品红）----
+    if (training::dbg::cv_filter && state.cv_valid)
+    {
+      const Eigen::Vector3d p_cv = state.kf.predict_future(kPredLeadS);
+      const Eigen::Vector3d p_cv_cam = to_camera(p_cv, calibration, imu_q);
+      std::vector<cv::Point3f> obj_cv;
+      for (const auto &o : obj)
+        obj_cv.emplace_back(o.x + static_cast<float>(p_cv_cam.x()),
+                            o.y + static_cast<float>(p_cv_cam.y()),
+                            o.z + static_cast<float>(p_cv_cam.z()));
+      std::vector<cv::Point2f> proj_cv;
+      cv::projectPoints(obj_cv, cv::Vec3d(0, 0, 0),
+                        cv::Vec3d(p_cv_cam.x(), p_cv_cam.y(), p_cv_cam.z()),
+                        calibration.matrix, calibration.distortion, proj_cv);
+      if (proj_cv.size() == 4)
+      {
+        for (int i{0}; i < 4; ++i)
+          state.cv_pred_corners[i] = proj_cv[static_cast<size_t>(i)];
+        state.cv_has_pred = true;
+      }
+    }
+    else
+    {
+      state.cv_has_pred = false;
+    }
+
     state.pred_hist.push_back({timestamp, p_pred,
                                d.class_id, static_cast<float>(d.confidence), d.box.width,
                                static_cast<float>(state.distance_m),
                                static_cast<float>(err_px),
                                state.phase,
                                state.same_target_frames,
-                               state.lost_frames});
+                               state.lost_frames,
+                               static_cast<float>(state.spin_rate),
+                               static_cast<float>(state.velocity.z())});
     while (state.pred_hist.size() > 64)
     {
       state.pred_hist.pop_front();

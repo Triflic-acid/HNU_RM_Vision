@@ -8,6 +8,7 @@
 #include "types.hpp"
 #include "kalman_cv.hpp"
 #include "ekf_ctrv.hpp"
+#include "spin_model.hpp"
 
 namespace training
 {
@@ -44,6 +45,9 @@ namespace training
     KalmanCV kf;
     // 旋转目标（小陀螺/前哨站）用 CTRV-EKF：状态含角速度 ω，能描述绕车体中心的圆周运动
     EkfCtrv ekf;
+    // 旋转目标模型：中心 + 半径 + 相位 + 角速度，换板不影响中心估计
+    SpinModel spin;
+    bool spin_active{false};   // 本帧是否用旋转模型出预测
 
     // ---- 对比用：匀速卡尔曼（CV）的结果 ----
     // 只在 dbg::cv_filter 打开时更新；关闭时这些字段保持默认值，不参与任何逻辑。

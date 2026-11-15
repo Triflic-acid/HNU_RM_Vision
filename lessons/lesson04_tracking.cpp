@@ -452,9 +452,23 @@ namespace training
     }
 
     // 6. 返回预测框 & 250ms历史数据
-    Eigen::Vector3d p_pred{state.ekf.predict_future(kPredLeadS)};
+    // 旋转靶：把当前观测喂给圆周模型（换板会跳相位，但中心/半径用中位数抗住）
+    const double t_sec = std::chrono::duration<double>(timestamp.time_since_epoch()).count();
+    state.spin.push(t_sec, p_world);
+    state.spin_active = state.spin.spinning();
+    if (state.spin_active)
+    {
+      state.spin_rate = state.spin.omega();
+    }
+
+    // 旋转时用圆周外推，直线运动时用 EKF 的 CTRV
+    Eigen::Vector3d p_pred = state.spin_active
+                                 ? state.spin.predict(kPredLeadS)
+                                 : state.ekf.predict_future(kPredLeadS);
+    if (!state.spin_active)
     {
       // 速度估计不准时，250 ms 外推会把位置放大成米级跳变；限幅后最坏只是"提前量不足"
+      // 旋转模型走的是圆周，位移本来就可能接近直径，不做限幅
       const Eigen::Vector3d shift{p_pred - state.ekf.position()};
       const double n{shift.norm()};
       if (n > kPredMaxShift)

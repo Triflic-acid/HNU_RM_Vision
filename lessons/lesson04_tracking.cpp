@@ -132,14 +132,6 @@ namespace training
         if (tvecs[i][2] <= 0.0)
           continue;
 
-        // 1. 板面法向必须朝向相机：镜像解的法向背对相机
-        cv::Mat R;
-        cv::Rodrigues(rvecs[i], R);
-        const Eigen::Vector3d n(R.at<double>(0, 2), R.at<double>(1, 2), R.at<double>(2, 2));
-        const Eigen::Vector3d to_cam(-tvecs[i][0], -tvecs[i][1], -tvecs[i][2]);
-        if (n.dot(to_cam) <= 0.0)
-          continue;
-
         // 2. 重投影合格
         const double e = reproj_error(obj, img, rvecs[i], tvecs[i], K, D);
         if (e > kMaxReprojPx)

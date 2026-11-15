@@ -409,7 +409,7 @@ int main(int argc, char **argv)
   PredLog pred_log;
   const bool pred_log_ok{training::dbg::pred_log && pred_log.open("simulation/outputs/pred_log.csv")};
   DetLog det_log;
-  const bool det_log_ok{training::dbg::pred_log && det_log.open("det_log.csv")};
+  const bool det_log_ok{training::dbg::pred_log && det_log.open("simulation/outputs/det_log.csv")};
 
   devices.open();
 

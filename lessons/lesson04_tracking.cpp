@@ -74,14 +74,20 @@ namespace training
     {
       switch (class_id)
       {
-      case 1: return 0.24;   // 英雄
-      case 2: return 0.22;   // 工程
+      case 1:
+        return 0.24; // 英雄
+      case 2:
+        return 0.22; // 工程
       case 3:
       case 4:
-      case 5: return 0.20;   // 步兵
-      case 7: return 0.26;   // 哨兵
-      case 0: return 0.30;   // 前哨站
-      default: return 0.20;
+      case 5:
+        return 0.20; // 步兵
+      case 7:
+        return 0.26; // 哨兵
+      case 0:
+        return 0.30; // 前哨站
+      default:
+        return 0.20;
       }
     }
 
@@ -89,12 +95,13 @@ namespace training
     constexpr double kPredMaxShift{0.80};
 
     // ---------- 观测有效性门限 ----------
-    constexpr float  kMinBoxPx{40.0F};      // 框宽下限：小于它解算不可信
+    constexpr float kMinBoxPx{40.0F}; // 框宽下限：小于它解算不可信
     // 切板死区：新候选正面度必须比锁定板高这么多才切（0.17 ≈ 10°）
     constexpr double kSwitchDeadZone{0.17};
     // 旋转 EKF：omega 超过它才认为是旋转靶；装甲板 yaw 的量测噪声
-    constexpr double kSpinOmegaThresh{1.0};   // rad/s
-    constexpr double kAngleSigma{0.20};       // rad
+    constexpr bool kEnableSpinEkf{false};   // 旋转 EKF 开关（实测比 CTRV 差，关闭）
+    constexpr double kSpinOmegaThresh{1.0}; // rad/s
+    constexpr double kAngleSigma{0.20};     // rad
     constexpr double kDistRatioMax{1.8};    // PnP 距离 / 单目距离 上限
     constexpr double kDistRatioMin{0.55};   // 下限
 
@@ -155,12 +162,12 @@ namespace training
               : Eigen::Matrix3d::Identity();
       Eigen::Vector3d n(R.at<double>(0, 2), R.at<double>(1, 2), R.at<double>(2, 2));
       Eigen::Vector3d nw = imu_q.toRotationMatrix() * Rc2g * n;
-      nw.z() = 0.0;                     // 只用水平分量算 yaw
+      nw.z() = 0.0; // 只用水平分量算 yaw
 
       const Eigen::Vector3d radial(p_world.x() - center.x(),
                                    p_world.y() - center.y(), 0.0);
       if (nw.norm() > 1e-6 && radial.norm() > 1e-6 && nw.dot(radial) < 0.0)
-        nw = -nw;                       // 翻到朝外的那一侧
+        nw = -nw; // 翻到朝外的那一侧
 
       return std::atan2(nw.y(), nw.x());
     }
@@ -339,11 +346,11 @@ namespace training
         if (same_plate)
         {
           const double face{frontality(detections[i], fx)};
-          if (face + kSwitchDeadZone > best_face)   // 没明显更正对 → 保持锁定
+          if (face + kSwitchDeadZone > best_face) // 没明显更正对 → 保持锁定
           {
             best_idx = static_cast<int>(i);
             best_face = face;
-              }
+          }
           break;
         }
       }
@@ -410,12 +417,12 @@ namespace training
       double inflate = 1.0;
       if (state.has_prev_q)
       {
-        const double dq = state.prev_q.angularDistance(imu_q);          // rad，两帧转角
+        const double dq = state.prev_q.angularDistance(imu_q); // rad，两帧转角
         const double dtq =
             std::max(std::chrono::duration<double>(timestamp - state.prev_q_stamp).count(), 1e-3);
-        const double rate = dq / dtq;                                   // rad/s
+        const double rate = dq / dtq; // rad/s
         state.gimbal_rate = rate;
-        inflate = 1.0 + std::clamp(rate / 2.0, 0.0, 8.0);               // 2 rad/s 起明显放大
+        inflate = 1.0 + std::clamp(rate / 2.0, 0.0, 8.0); // 2 rad/s 起明显放大
       }
       state.prev_q = imu_q;
       state.prev_q_stamp = timestamp;
@@ -495,7 +502,7 @@ namespace training
 
     state.position = state.ekf.position();
     state.velocity = state.ekf.velocity();
-    state.spin_rate = state.ekf.turn_rate();   // rad/s，供日志/诊断
+    state.spin_rate = state.ekf.turn_rate(); // rad/s，供日志/诊断
 
     // ---- 对比开关：同时跑匀速卡尔曼，供离线对比（不影响主链路）----
     if (training::dbg::cv_filter)
@@ -523,24 +530,33 @@ namespace training
     }
 
     // 6. 返回预测框 & 250ms历史数据
-    // 旋转靶：圆周 EKF。关键是把装甲板自身的 yaw 也作为量测（同济 ypda 的 a），
-    // 否则 theta 与 omega 不可区分，omega 永远学不出来（实测停在 0.2~1.3，真值 2.0）。
-    const Eigen::Vector3d c_for_yaw = state.spin_ekf.initialized()
-                                         ? state.spin_ekf.center()
-                                         : p_world;
-    const double plate_yaw = armor_yaw_world(rvec, calibration, imu_q, c_for_yaw, p_world);
-    if (!state.spin_ekf.initialized())
+    // 旋转模型**默认关闭**。实测（outputs/history）旋转段位移 90 分位：
+    // 仅 CTRV ：87~177 mm <- 最好
+    // 旋转 EKF ：672~845 mm <- 更差
+    // 所以统一用 CTRV 出预测；旋转 EKF 代码保留，改开关即可对比。
+    if (kEnableSpinEkf)
     {
-      state.spin_ekf.set_prior_radius(armor_ring_prior(d.class_id));
-      state.spin_ekf.init(p_world);
-    }
-    state.spin_ekf.predict(dt);
-    state.spin_ekf.update_with_angle(p_world, plate_yaw, kAngleSigma);
+      const Eigen::Vector3d c_for_yaw = state.spin_ekf.initialized()
+                                            ? state.spin_ekf.center()
+                                            : p_world;
+      const double plate_yaw = armor_yaw_world(rvec, calibration, imu_q, c_for_yaw, p_world);
+      if (!state.spin_ekf.initialized())
+      {
+        state.spin_ekf.set_prior_radius(armor_ring_prior(d.class_id));
+        state.spin_ekf.init(p_world);
+      }
+      state.spin_ekf.predict(dt);
+      state.spin_ekf.update_with_angle(p_world, plate_yaw, kAngleSigma);
 
-    const double w_spin = state.spin_ekf.omega();
-    state.spin_active = std::abs(w_spin) > kSpinOmegaThresh;
-    if (state.spin_active)
-      state.spin_rate = w_spin;
+      const double w_spin = state.spin_ekf.omega();
+      state.spin_active = std::abs(w_spin) > kSpinOmegaThresh;
+      if (state.spin_active)
+        state.spin_rate = w_spin;
+    }
+    else
+    {
+      state.spin_active = false; // 只用 CTRV
+    }
 
     Eigen::Vector3d p_pred = state.spin_active
                                  ? state.spin_ekf.predict_future(kPredLeadS)

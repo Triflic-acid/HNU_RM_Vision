@@ -60,6 +60,8 @@ namespace training
     static constexpr double kMaxSpeed = 8.0;
     // 角速度物理上限（rad/s）：小陀螺实测 4~7，留余量到 12
     static constexpr double kMaxOmega = 12.0;
+    // 垂直速度上限（m/s）：地面机器人几乎不上下移动，钳紧可以抑制深度噪声带来的 z 抖动
+    static constexpr double kMaxVz = 1.5;
 
     void configure(double q_accel_xy = 6.0, double q_accel_z = 2.0,
                    double q_theta = 0.05, double q_omega = 4.0,
@@ -90,7 +92,7 @@ namespace training
       x_(5) = p.z();
 
       P_.setZero();
-      P_.diagonal() << R_(0,0), R_(1,1), 25.0, 1.0, 4.0, R_(2,2), 4.0;
+      P_.diagonal() << R_(0, 0), R_(1, 1), 25.0, 1.0, 4.0, R_(2, 2), 4.0;
       initialized_ = true;
     }
 
@@ -152,8 +154,8 @@ namespace training
         x_(2) = std::copysign(kMaxSpeed, x_(2));
       if (std::abs(x_(4)) > kMaxOmega)
         x_(4) = std::copysign(kMaxOmega, x_(4));
-      if (std::abs(x_(6)) > kMaxSpeed)
-        x_(6) = std::copysign(kMaxSpeed, x_(6));
+      if (std::abs(x_(6)) > kMaxVz)
+        x_(6) = std::copysign(kMaxVz, x_(6));
     }
 
     // 当前位置 / 速度（速度由极坐标还原成笛卡尔）
@@ -211,7 +213,7 @@ namespace training
 
       Q(0, 0) = qxy * dt * dt * dt / 3.0;
       Q(1, 1) = Q(0, 0);
-      Q(2, 2) = qxy * dt;            // 速度
+      Q(2, 2) = qxy * dt; // 速度
       Q(3, 3) = q_theta_ * q_theta_ * dt;
       Q(4, 4) = q_omega_ * q_omega_ * dt;
       Q(5, 5) = qz * dt * dt * dt / 3.0;

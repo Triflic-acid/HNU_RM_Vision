@@ -88,30 +88,21 @@ namespace
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
   }
 
-  // 云台/相机的固定偏置（与 lesson04 的 gimbal_yaw_offset 保持一致）
-  double gimbal_yaw_offset()
-  {
-    static const double v = []
-    {
-      double deg = 90.0;
-      if (const char *e = std::getenv("GIMBAL_YAW_OFFSET_DEG"))
-        deg = std::atof(e);
-      return deg * M_PI / 180.0;
-    }();
-    return v;
-  }
-
+  // 云台系 → 世界系：R_gimbal2world = R_gimbal2imubody^T · R_imubody2imuabs
   Eigen::Matrix3d r_gimbal_to_world(const Eigen::Quaterniond &imu_q)
   {
-    const double off = gimbal_yaw_offset();
-    if (std::abs(off) < 1e-9)
-      return imu_q.toRotationMatrix();
-    Eigen::Matrix3d Rz = Eigen::Matrix3d::Identity();
-    Rz(0, 0) = std::cos(off);
-    Rz(0, 1) = -std::sin(off);
-    Rz(1, 0) = std::sin(off);
-    Rz(1, 1) = std::cos(off);
-    return Rz * imu_q.toRotationMatrix();
+    Eigen::Matrix3d R_b2a = Eigen::Matrix3d::Identity();
+    const double off = training::g_gimbal_yaw_offset;
+    if (std::abs(off) > 1e-9)
+    {
+      Eigen::Matrix3d Rz = Eigen::Matrix3d::Identity();
+      Rz(0, 0) = std::cos(off);
+      Rz(0, 1) = -std::sin(off);
+      Rz(1, 0) = std::sin(off);
+      Rz(1, 1) = std::cos(off);
+      R_b2a = Rz * R_b2a;
+    }
+    return imu_q.toRotationMatrix().transpose() * R_b2a;
   }
 
   // 世界系点 → 像素。用于把弹道解算出的击打点画到画面上。
@@ -317,10 +308,17 @@ namespace
     char line1[160];
     char line2[160];
 
+    const int n_ms = static_cast<int>(training::g_pred_lead_s * 1000.0 + 0.5);
+
     if (st.has_pred_err)
-      std::snprintf(line1, sizeof(line1), "pred_err(250ms) = %6.1f mm", st.pred_err_mm);
+      std::snprintf(line1, sizeof(line1),
+                    "pred_err(%dms) = %6.1f mm   pnp_err = %6.1f mm",
+                    n_ms, st.pred_err_mm,
+                    st.has_pnp_err ? st.pnp_err_mm : std::nanf(""));
     else
-      std::snprintf(line1, sizeof(line1), "pred_err(250ms) =    ---");
+      std::snprintf(line1, sizeof(line1),
+                    "pred_err(%dms) =    ---      pnp_err = %6.1f mm",
+                    n_ms, st.has_pnp_err ? st.pnp_err_mm : std::nanf(""));
 
     const char *ph{(st.phase == training::TrackingState::Phase::kTracking)    ? "TRACK"
                    : (st.phase == training::TrackingState::Phase::kDetecting) ? "DETECT"
@@ -661,16 +659,59 @@ int main(int argc, char **argv)
       if (truth_ok)
       {
         truth.poll(truth_targets, truth_runes);
+        if (truth_targets.empty())
+        {
+          static int warn = 0;
+          if (++warn == 60 && training::dbg::truth)
+            std::printf("[truth] 共享内存可读，但 target_count=0（仿真器可能暂停或未生成靶车）\n");
+        }
         if (!truth_targets.empty())
         {
+          // 选离我们当前估计最近的靶车（防止拿错车）
+          const training::truth::Target *pick = &truth_targets[0];
+          double best = 1e9;
+          for (const auto &t : truth_targets)
+          {
+            const Eigen::Vector3d tp(t.position[0], t.position[1], t.position[2]);
+            const double d = (tp - tracking.position).squaredNorm();
+            if (d < best)
+            {
+              best = d;
+              pick = &t;
+            }
+          }
           truth_hist.push_back({input->timestamp,
-                                Eigen::Vector3d(truth_targets[0].position[0],
-                                                truth_targets[0].position[1],
-                                                truth_targets[0].position[2]),
-                                truth_targets[0].yaw,
-                                static_cast<int>(truth_targets[0].armor_label)});
+                                Eigen::Vector3d(pick->position[0],
+                                                pick->position[1],
+                                                pick->position[2]),
+                                pick->yaw,
+                                static_cast<int>(pick->armor_label)});
           while (truth_hist.size() > 120)
             truth_hist.pop_front();
+        }
+      }
+
+      // 静止靶验收：PnP 位置与该时刻真值比对
+      tracking.has_pnp_err = false;
+      if (truth_ok && !truth_targets.empty() &&
+          tracking.phase == training::TrackingState::Phase::kTracking)
+      {
+        double best = 1e9;
+        Eigen::Vector3d tp;
+        for (const auto &t : truth_targets)
+        {
+          const Eigen::Vector3d p(t.position[0], t.position[1], t.position[2]);
+          const double d = (p - tracking.position).squaredNorm();
+          if (d < best)
+          {
+            best = d;
+            tp = p;
+          }
+        }
+        if (best < 25.0) // 5 m 以内才算同一块板
+        {
+          tracking.pnp_err_mm = (tp - tracking.position).norm() * 1000.0;
+          tracking.has_pnp_err = true;
         }
       }
 
@@ -713,6 +754,24 @@ int main(int argc, char **argv)
           training::g_gimbal_pitch = -std::asin(std::clamp(R(2, 0), -1.0, 1.0));
         }
 
+        // 标定打印：目标在云台系/世界系的方位，以及解算出来的瞄准角
+        {
+          static int calib_n = 0;
+          if (++calib_n % 30 == 0)
+          {
+            const Eigen::Matrix3d R = r_gimbal_to_world(input->imu_q);
+            const Eigen::Vector3d pg = R.transpose() * target->position;
+            std::printf("[calib] off=%.0f°  p_gimbal=(%+.2f,%+.2f,%+.2f) "
+                        "p_world=(%+.2f,%+.2f,%+.2f)  yaw_g=%+.1f° yaw_w=%+.1f°\n",
+                        training::g_gimbal_yaw_offset * 180.0 / M_PI,
+                        pg.x(), pg.y(), pg.z(),
+                        target->position.x(), target->position.y(), target->position.z(),
+                        std::atan2(pg.y(), pg.x()) * 180.0 / M_PI,
+                        std::atan2(target->position.y(), target->position.x()) * 180.0 / M_PI);
+            std::fflush(stdout);
+          }
+        }
+
         command = training::lesson05_aiming(*target,
                                             input->timestamp,
                                             input->bullet_speed);
@@ -735,7 +794,8 @@ int main(int argc, char **argv)
           continue;
         }
 
-        const auto t_target{rec.t + std::chrono::milliseconds(250)};
+        const auto t_target{rec.t + std::chrono::duration_cast<training::TimePoint::duration>(
+                                        std::chrono::duration<double>(training::g_pred_lead_s))};
 
         const TruthSample *best{nullptr};
         double best_dt{1e9};
@@ -752,7 +812,7 @@ int main(int argc, char **argv)
               best = &s;
             }
           }
-          if (best && best_dt >= 40.0)
+          if (best && best_dt >= 60.0)
             best = nullptr; // 真值离目标时刻太远
         }
 
@@ -832,10 +892,11 @@ int main(int argc, char **argv)
                                                                : "off";
         char hud[200];
         std::snprintf(hud, sizeof(hud),
-                      "[%s] %zu targets  %.1fms  ROI:%s  refine:%s  drag:%s  m:mode z:roi p:refine d:drag",
+                      "[%s] %zu targets  %.1fms  ROI:%s  refine:%s  drag:%s  n:%dms  m:mode z:roi p:refine d:drag",
                       mode == training::DetMode::kArmor ? "ARMOR" : "RUNE",
                       detections.size(), last_ms, roi_txt, refine_name(refine_mode),
-                      training::g_ballistics_drag ? "on" : "off");
+                      training::g_ballistics_drag ? "on" : "off",
+                      static_cast<int>(training::g_pred_lead_s * 1000.0 + 0.5));
         cv::putText(canvas, hud, cv::Point(12, 26), cv::FONT_HERSHEY_SIMPLEX, 0.65,
                     mode == training::DetMode::kArmor ? cv::Scalar(0, 255, 0)
                                                       : cv::Scalar(0, 128, 255),
@@ -867,6 +928,30 @@ int main(int argc, char **argv)
                 roi_mode == RoiMode::kAuto     ? "自动(PnP)"
                 : roi_mode == RoiMode::kManual ? "手动 2.0x"
                                                : "关闭");
+      }
+      else if (key == '[' || key == ']')
+      {
+        training::g_gimbal_yaw_offset +=
+            (key == '[' ? -5.0 : 5.0) * M_PI / 180.0;
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "%.0f°",
+                      training::g_gimbal_yaw_offset * 180.0 / M_PI);
+        log_gui(key == '[' ? "[" : "]", "云台偏置", buf);
+      }
+      else if (key == '\\')
+      {
+        training::g_gimbal_yaw_offset = 0.0;
+        log_gui("\\", "云台偏置", "复位 0°");
+      }
+      else if (key == 'n' || key == 'N')
+      {
+        static const double steps[] = {0.0, 0.10, 0.25, 0.50};
+        static int idx = 2; // 默认 250 ms
+        idx = (idx + 1) % 4;
+        training::g_pred_lead_s = steps[idx];
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.0f ms", steps[idx] * 1000.0);
+        log_gui("n", "预测提前量", buf);
       }
       else if (key == 'd' || key == 'D')
       {

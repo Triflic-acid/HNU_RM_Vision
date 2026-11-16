@@ -58,7 +58,7 @@ namespace training
     constexpr int kDetectFrames{5};  // 连续命中5帧后进入 TRACKING
     constexpr int kTempLostMax{10};  // 允许连续丢失10帧
     constexpr double kMaxReprojPx{3.0};
-    constexpr double kPredLeadS{0.250}; // 预测250ms后的位置
+    // 预测提前量 n 走 training::g_pred_lead_s（默认 0.25 s，可运行时切换）
 
     // ---------- 卡尔曼噪声参数 ----------
     // 关键：configure() 之前从未被调用，滤波器一直用默认 q_accel=8 m/s²，
@@ -253,26 +253,12 @@ namespace training
       return true;
     }
     // 相机系 -> 云台系 -> 世界系
-    // 云台/相机相对底盘的固定偏置（rad）。
-    // 实测（2026-11-16）：直接按 vision_recv_data 的 yaw 建 R_g2w 时，
-    // 目标世界坐标会整体转 -90°（p_world ≈ Rz(-90°)·p_gimbal），
-    // 导致 lesson05 算出 yaw≈-92° 而不是 0°，云台永远对不上。
-    // 这里补 +90°。可用环境变量 GIMBAL_YAW_OFFSET_DEG 现场标定。
-    double gimbal_yaw_offset()
-    {
-      static const double v = []
-      {
-        double deg = 90.0;
-        if (const char *e = std::getenv("GIMBAL_YAW_OFFSET_DEG"))
-          deg = std::atof(e);
-        return deg * M_PI / 180.0;
-      }();
-      return v;
-    }
-
+    // 云台系 → 世界系。
+    // 说明：**瞄准链路已不再依赖它**（lesson05 用云台系位置 + 角度增量），
+    // 这里只影响日志与旋转模型的外推，保持最朴素的 R(imu_q) 并由偏置微调。
     Eigen::Matrix3d r_gimbal_to_world(const Eigen::Quaterniond &imu_q)
     {
-      const double off = gimbal_yaw_offset();
+      const double off = training::g_gimbal_yaw_offset;
       if (std::abs(off) < 1e-9)
         return imu_q.toRotationMatrix();
       Eigen::Matrix3d Rz = Eigen::Matrix3d::Identity();
@@ -642,8 +628,8 @@ namespace training
     }
 
     Eigen::Vector3d p_pred = state.spin_active
-                                 ? state.spin_ekf.predict_future(kPredLeadS)
-                                 : state.ekf.predict_future(kPredLeadS);
+                                 ? state.spin_ekf.predict_future(training::g_pred_lead_s)
+                                 : state.ekf.predict_future(training::g_pred_lead_s);
     if (!state.spin_active)
     {
       // 速度估计不准时，250 ms 外推会把位置放大成米级跳变；限幅后最坏只是"提前量不足"
@@ -680,7 +666,7 @@ namespace training
     // ---- 对比开关：CV 的预测框（品红）----
     if (training::dbg::cv_filter && state.cv_valid)
     {
-      const Eigen::Vector3d p_cv = state.kf.predict_future(kPredLeadS);
+      const Eigen::Vector3d p_cv = state.kf.predict_future(training::g_pred_lead_s);
       const Eigen::Vector3d p_cv_cam = to_camera(p_cv, calibration, imu_q);
       std::vector<cv::Point3f> obj_cv;
       for (const auto &o : obj)
@@ -701,6 +687,21 @@ namespace training
     else
     {
       state.cv_has_pred = false;
+    }
+
+    // 把目标在云台系下的位置/速度暴露给 lesson05（与坐标系约定无关）
+    {
+      const Eigen::Matrix3d R_c2g_e =
+          (calibration.camera_to_gimbal.rows() == 3 &&
+           calibration.camera_to_gimbal.cols() == 3)
+              ? calibration.camera_to_gimbal
+              : Eigen::Matrix3d::Identity();
+      training::g_target_gimbal =
+          R_c2g_e * p_cam + calibration.camera_to_gimbal_translation;
+      const Eigen::Vector3d v_world = state.velocity;
+      training::g_target_gimbal_vel =
+          r_gimbal_to_world(imu_q).transpose() * v_world;
+      training::g_target_gimbal_valid = state.phase == TrackingState::Phase::kTracking;
     }
 
     // ---- 弹道解算（北工大《弹道解算及云台角度求解算法》）----

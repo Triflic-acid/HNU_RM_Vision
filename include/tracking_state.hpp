@@ -73,6 +73,9 @@ namespace training
     Eigen::Vector3d position{Eigen::Vector3d::Zero()};
     Eigen::Vector3d velocity{Eigen::Vector3d::Zero()};
     double distance_m{0.0}; // 最近一次解算得到的目标距离，0 表示未测得
+    // 距离的滑动平均：用于"时间维度的门 2"，拒绝突然变成 5 m 的误检
+    double dist_ema{0.0};
+    int dist_reject{0}; // 门 2b 连续拒绝次数（用于逃生）
     double reproj_err_px{0.0};
 
     // 像素速度（单位：px/s）：用于 ROI 预测，不需要 imu 和外参即可外推

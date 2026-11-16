@@ -1,5 +1,5 @@
 #pragma once
-// 弹道解算 + 云台角求解（参考北京工业大学《弹道解算及云台角度求解算法》）
+// 弹道解算 + 云台角求解（参考：北京工业大学 - 弹道解算及云台角度求解算法）
 //
 // 物理模型：重力 + 与速度平方成正比的空气阻力
 //   dp/dt = v
@@ -25,6 +25,12 @@ namespace training
   // [projectile.aerodynamics] enabled = false 一致）。
   // 运行时可用按键或环境变量打开，不改代码即可对比两种弹道。
   inline bool g_ballistics_drag{false};
+
+  // 当前云台绝对角（rad）。由 main 每帧从 SensorData::imu_q 解出后写入，
+  // lesson05 用它做开火门控（"指到哪"与"该指到哪"的差）。
+  // 来源：lesson02 订阅的 vision_recv_data 里的 yaw / pitch / roll。
+  inline double g_gimbal_yaw{0.0};
+  inline double g_gimbal_pitch{0.0};
 
   struct ProjectileParams
   {

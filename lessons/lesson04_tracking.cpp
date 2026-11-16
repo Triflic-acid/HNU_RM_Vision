@@ -11,6 +11,7 @@ lesson4 实现
 #include <opencv2/calib3d.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -110,6 +111,10 @@ namespace training
     constexpr double kAngleSigma{0.20};     // rad
     constexpr double kDistRatioMax{1.8};    // PnP 距离 / 单目距离 上限
     constexpr double kDistRatioMin{0.55};   // 下限
+    // 时间维度的距离比：超过它认为换了个物体（不是同一块板）
+    constexpr double kDistJumpRatio{1.35};
+    // 连续被门 2b 拒绝多少帧后强制重新同步（防止 EMA 陈旧导致永久锁死）
+    constexpr int kDistRejectMax{12};
 
     // 噪声量测模型（距离自适应）
     // 由针孔几何推出：
@@ -248,6 +253,36 @@ namespace training
       return true;
     }
     // 相机系 -> 云台系 -> 世界系
+    // 云台/相机相对底盘的固定偏置（rad）。
+    // 实测（2026-11-16）：直接按 vision_recv_data 的 yaw 建 R_g2w 时，
+    // 目标世界坐标会整体转 -90°（p_world ≈ Rz(-90°)·p_gimbal），
+    // 导致 lesson05 算出 yaw≈-92° 而不是 0°，云台永远对不上。
+    // 这里补 +90°。可用环境变量 GIMBAL_YAW_OFFSET_DEG 现场标定。
+    double gimbal_yaw_offset()
+    {
+      static const double v = []
+      {
+        double deg = 90.0;
+        if (const char *e = std::getenv("GIMBAL_YAW_OFFSET_DEG"))
+          deg = std::atof(e);
+        return deg * M_PI / 180.0;
+      }();
+      return v;
+    }
+
+    Eigen::Matrix3d r_gimbal_to_world(const Eigen::Quaterniond &imu_q)
+    {
+      const double off = gimbal_yaw_offset();
+      if (std::abs(off) < 1e-9)
+        return imu_q.toRotationMatrix();
+      Eigen::Matrix3d Rz = Eigen::Matrix3d::Identity();
+      Rz(0, 0) = std::cos(off);
+      Rz(0, 1) = -std::sin(off);
+      Rz(1, 0) = std::sin(off);
+      Rz(1, 1) = std::cos(off);
+      return Rz * imu_q.toRotationMatrix();
+    }
+
     Eigen::Vector3d to_world(const Eigen::Vector3d &p_cam,
                              const CameraCalibration &cal,
                              const Eigen::Quaterniond &imu_q)
@@ -258,8 +293,7 @@ namespace training
         R_c2g = cal.camera_to_gimbal;
       t_c2g = cal.camera_to_gimbal_translation;
       const Eigen::Vector3d p_gimbal = R_c2g * p_cam + t_c2g;
-      const Eigen::Matrix3d R_g2w = imu_q.toRotationMatrix();
-      return R_g2w * p_gimbal;
+      return r_gimbal_to_world(imu_q) * p_gimbal;
     }
     // 世界系 -> 相机系（用于标注预测框）
     Eigen::Vector3d to_camera(const Eigen::Vector3d &p_world,
@@ -268,7 +302,7 @@ namespace training
     {
       const Eigen::Matrix3d R_c2g = cal.camera_to_gimbal;
       const Eigen::Vector3d t_c2g = cal.camera_to_gimbal_translation;
-      const Eigen::Matrix3d R_g2w = imu_q.toRotationMatrix();
+      const Eigen::Matrix3d R_g2w = r_gimbal_to_world(imu_q);
       const Eigen::Vector3d p_gimbal = R_g2w.transpose() * p_world;
       return R_c2g.transpose() * (p_gimbal - t_c2g);
     }
@@ -372,6 +406,36 @@ namespace training
 
     // 3. 坐标变换
     const Eigen::Vector3d p_cam(tvec[0], tvec[1], tvec[2]);
+
+    // 门 2b：时间维度——距离不能突然跳变。
+    // 实测（2026-11-16）：选板偶尔挑到 4~5.4 m 的远处目标（正常 2.7 m），
+    // 它的 z 更高（2.9 m vs 1.9 m），一帧就把垂直估计拽上去 → 上下抖动。
+    {
+      const double d_now = p_cam.norm();
+      const bool jump =
+          state.dist_ema > 0.5 &&
+          (d_now > kDistJumpRatio * state.dist_ema || d_now < state.dist_ema / kDistJumpRatio);
+
+      if (jump)
+      {
+        // 逃生：连续拒绝超过 kDistRejectMax 帧，说明是我们自己的 EMA 陈旧了
+        // （目标真的走远了/靠近了），此时重新同步，不能永久锁死。
+        if (++state.dist_reject > kDistRejectMax)
+        {
+          state.dist_ema = d_now;
+          state.dist_reject = 0;
+        }
+        else
+        {
+          return degrade();
+        }
+      }
+      else
+      {
+        state.dist_reject = 0;
+        state.dist_ema = (state.dist_ema > 0.0) ? 0.9 * state.dist_ema + 0.1 * d_now : d_now;
+      }
+    }
 
     // 门 2：PnP 距离必须与单目估距一致。
     // 远处小目标（框 30 px）会被解到 16 m，重投影反而更小（0.31 px），
@@ -566,7 +630,9 @@ namespace training
       state.spin_ekf.update_multi(plates, N);
 
       const double w_spin = state.spin_ekf.omega();
-      state.spin_active = std::abs(w_spin) > kSpinOmegaThresh;
+      // 半径撞到边界说明圆周模型发散 → 退回 CTRV，别用错弧长外推
+      state.spin_active = std::abs(w_spin) > kSpinOmegaThresh &&
+                          state.spin_ekf.radius_trusted();
       if (state.spin_active)
         state.spin_rate = w_spin;
     }
@@ -637,14 +703,15 @@ namespace training
       state.cv_has_pred = false;
     }
 
-    // 弹道解算
-    // 参考：北工大 - 弹道解算及云台角度求解算法
+    // ---- 弹道解算（北工大《弹道解算及云台角度求解算法》）----
     // 目标世界状态转到云台系 → Newton 解 (yaw, pitch, τ) → 输出击打点
     {
       ProjectileParams pp;
-      pp.v0 = 25.0;                          // 先用仿真默认弹速
+      pp.v0 = 25.0; // 先用仿真默认弹速
+      pp.rho = 1.225;
+      pp.drag = g_ballistics_drag;           // 空气阻力开关
       pp.latency = state.pipeline_latency_s; // 处理+开火延迟
-      const Eigen::Matrix3d R_g2w = imu_q.toRotationMatrix();
+      const Eigen::Matrix3d R_g2w = r_gimbal_to_world(imu_q);
       const Eigen::Vector3d p_g = R_g2w.transpose() * state.position;
       const Eigen::Vector3d v_g = R_g2w.transpose() * state.velocity;
 

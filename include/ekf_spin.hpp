@@ -29,18 +29,21 @@ namespace training
     using Vec9 = Eigen::Matrix<double, 9, 1>;
     using Mat9 = Eigen::Matrix<double, 9, 9>;
 
-    static constexpr double kMaxOmega = 12.0;  // rad/s
-    static constexpr double kMaxSpeed = 8.0;   // m/s
-    static constexpr double kMaxVz = 1.5;      // m/s
-    static constexpr double kMinRadius = 0.08; // m
-    static constexpr double kMaxRadius = 0.35; // m
+    static constexpr double kMaxOmega = 12.0;   // rad/s
+    static constexpr double kMaxSpeed = 8.0;    // m/s
+    static constexpr double kMaxVz = 1.5;       // m/s
+    static constexpr double kMinRadius = 0.08;  // m
+    static constexpr double kMaxRadius = 0.35;  // m，硬上限
+    // 可信区间：装甲环半径落在 [0.12, 0.28] 才认为 r 估得对
+    static constexpr double kTrustRadiusLo = 0.12;
+    static constexpr double kTrustRadiusHi = 0.28;
 
-    void configure(double q_center = 1.0,  // 中心平动加速度噪声 m/s²
-                   double q_theta = 0.30,  // 相位噪声 rad/√s
-                   double q_omega = 0.60,  // 角加速度噪声 rad/s²
-                   double q_radius = 0.02, // 半径漂移 m/√s（很小：半径是常数）
-                   double q_z = 0.02,      // 垂直加速度噪声
-                   double r_meas = 0.05)   // 位置量测噪声 m
+    void configure(double q_center = 1.0,   // 中心平动加速度噪声 m/s²
+                   double q_theta = 0.30,   // 相位噪声 rad/√s
+                   double q_omega = 0.60,   // 角加速度噪声 rad/s²
+                   double q_radius = 0.02,  // 半径漂移 m/√s（很小：半径是常数）
+                   double q_z = 0.02,       // 垂直加速度噪声
+                   double r_meas = 0.05)    // 位置量测噪声 m
     {
       q_center_ = q_center;
       q_theta_ = q_theta;
@@ -65,6 +68,11 @@ namespace training
     }
     int armor_num() const { return armor_num_; }
 
+    // 固定半径：不再把 r 当状态估计，每帧强制回先验。
+    // 理由（实测 2026-11-16）：r 会一路漂到上限 0.35（真实 0.20），
+    // 导致圆周外推的弧长放大 75%，预测点飞到目标外。同济也是按车型给常数半径。
+    void set_fixed_radius(bool fix) { fixed_radius_ = fix; }
+
     // 显式指定板数（按车型配置时用；调用后不再做在线判别，除非再设候选集）
     void set_armor_num(int n)
     {
@@ -81,30 +89,25 @@ namespace training
     }
 
     bool initialized() const { return initialized_; }
-    void reset()
-    {
-      initialized_ = false;
-      x_.setZero();
-      P_.setIdentity();
-    }
+    void reset() { initialized_ = false; x_.setZero(); P_.setIdentity(); }
 
     // 用第一个量测初始化：半径取先验，相位假设 0，中心反推
     void init(const Eigen::Vector3d &p)
     {
       x_.setZero();
       x_(6) = prior_r_;
-      x_(0) = p.x() - prior_r_; // 相位 0 => 板在中心右侧
+      x_(0) = p.x() - prior_r_;   // 相位 0 => 板在中心右侧
       x_(2) = p.y();
       x_(7) = p.z();
 
       P_.setZero();
-      P_(0, 0) = 4.0; // 中心位置很不确定
+      P_(0, 0) = 4.0;   // 中心位置很不确定
       P_(2, 2) = 4.0;
-      P_(1, 1) = 25.0; // 速度
+      P_(1, 1) = 25.0;  // 速度
       P_(3, 3) = 25.0;
-      P_(4, 4) = M_PI * M_PI; // 相位完全未知
-      P_(5, 5) = 16.0;        // ω 未知（±4 rad/s）
-      P_(6, 6) = 0.01 * 0.01; // 半径比较确定（有先验）
+      P_(4, 4) = M_PI * M_PI;   // 相位完全未知
+      P_(5, 5) = 16.0;          // ω 未知（±4 rad/s）
+      P_(6, 6) = fixed_radius_ ? 1e-10 : 0.01 * 0.01;   // 半径：固定或按先验
       P_(7, 7) = R_(2, 2);
       P_(8, 8) = 4.0;
       initialized_ = true;
@@ -117,10 +120,10 @@ namespace training
 
       // 线性状态转移（θ、r 不动，只有中心/相位/高度积分）
       Mat9 F = Mat9::Identity();
-      F(0, 1) = dt; // xc += vxc·dt
-      F(2, 3) = dt; // yc += vyc·dt
-      F(4, 5) = dt; // θ  += ω·dt
-      F(7, 8) = dt; // z  += vz·dt
+      F(0, 1) = dt;    // xc += vxc·dt
+      F(2, 3) = dt;    // yc += vyc·dt
+      F(4, 5) = dt;    // θ  += ω·dt
+      F(7, 8) = dt;    // z  += vz·dt
 
       Mat9 Q = Mat9::Zero();
       const double qc = q_center_ * q_center_;
@@ -130,7 +133,7 @@ namespace training
       Q(1, 1) = Q(3, 3) = qc * dt;
       Q(4, 4) = q_theta_ * q_theta_ * dt;
       Q(5, 5) = q_omega_ * q_omega_ * dt;
-      Q(6, 6) = q_radius_ * q_radius_ * dt;
+      Q(6, 6) = fixed_radius_ ? 0.0 : q_radius_ * q_radius_ * dt;
       const double qz = q_z_ * q_z_;
       Q(7, 7) = qz * dt * dt * dt / 3.0;
       Q(7, 8) = Q(8, 7) = qz * dt * dt / 2.0;
@@ -211,17 +214,15 @@ namespace training
       H(1, 4) = r * c;
       H(1, 6) = s0;
       H(2, 7) = 1.0;
-      H(3, 4) = 1.0; // 相位直接可观测
+      H(3, 4) = 1.0;                       // 相位直接可观测
 
       Eigen::Matrix<double, 4, 1> y;
       y(0) = p.x() - (x_(0) + r * c);
       y(1) = p.y() - (x_(2) + r * s0);
       y(2) = p.z() - x_(7);
       double da = a_world - th;
-      while (da > M_PI)
-        da -= 2 * M_PI;
-      while (da < -M_PI)
-        da += 2 * M_PI;
+      while (da > M_PI) da -= 2 * M_PI;
+      while (da < -M_PI) da += 2 * M_PI;
       y(3) = da;
 
       Eigen::Matrix4d Rm = Eigen::Matrix4d::Zero();
@@ -238,14 +239,22 @@ namespace training
 
       clamp_state();
       wrap_theta();
+
+      if (fixed_radius_)
+      {
+        x_(6) = prior_r_;                 // 强制回先验
+        P_.row(6).setZero();
+        P_.col(6).setZero();
+        P_(6, 6) = 1e-10;
+      }
     }
 
     // ---- 多板观测 ----
     struct PlateObs
     {
-      Eigen::Vector3d p;   // 世界系板中心
-      double yaw{0.0};     // 板法向世界 yaw（朝外）
-      double sigma_a{0.2}; // 该板 yaw 的噪声
+      Eigen::Vector3d p;      // 世界系板中心
+      double yaw{0.0};        // 板法向世界 yaw（朝外）
+      double sigma_a{0.2};    // 该板 yaw 的噪声
     };
 
     // 用当帧所有可见板更新：先按角度残差关联，再逐块更新。
@@ -270,7 +279,7 @@ namespace training
         for (int n : candidates_)
         {
           const double sc = gap_score(plates, n);
-          if (sc < 0.0) // 该 N 下两块板重合，无法判定
+          if (sc < 0.0)                       // 该 N 下两块板重合，无法判定
             continue;
           if (sc < best_score)
           {
@@ -278,7 +287,7 @@ namespace training
             best_n = n;
           }
         }
-        if (best_score < 0.15 && best_n != armor_num_) // 残差 < 15% 且明显更好
+        if (best_score < 0.15 && best_n != armor_num_)   // 残差 < 15% 且明显更好
         {
           if (best_n == pending_n_)
             ++pending_count_;
@@ -300,7 +309,7 @@ namespace training
       }
 
       const int N = armor_num_;
-      const double kAssocMax = 45.0 * M_PI / 180.0; // 关联门限
+      const double kAssocMax = 45.0 * M_PI / 180.0;   // 关联门限
 
       int used = 0;
       for (const auto &obs : plates)
@@ -313,10 +322,8 @@ namespace training
         {
           const double th_id = x_(4) + id * 2.0 * M_PI / N;
           double d = phi_meas - th_id;
-          while (d > M_PI)
-            d -= 2 * M_PI;
-          while (d < -M_PI)
-            d += 2 * M_PI;
+          while (d > M_PI) d -= 2 * M_PI;
+          while (d < -M_PI) d += 2 * M_PI;
           if (std::abs(d) < best_err)
           {
             best_err = std::abs(d);
@@ -348,10 +355,8 @@ namespace training
           const double phi_i = std::atan2(plates[i].p.y() - x_(2), plates[i].p.x() - x_(0));
           const double phi_j = std::atan2(plates[j].p.y() - x_(2), plates[j].p.x() - x_(0));
           double g = phi_j - phi_i;
-          while (g > M_PI)
-            g -= 2 * M_PI;
-          while (g < -M_PI)
-            g += 2 * M_PI;
+          while (g > M_PI) g -= 2 * M_PI;
+          while (g < -M_PI) g += 2 * M_PI;
           const int k = static_cast<int>(std::lround(std::abs(g) / step));
           if (k == 0)
             continue;
@@ -360,7 +365,7 @@ namespace training
         }
       }
       if (cnt == 0)
-        return -1.0; // 无法判定
+        return -1.0;                      // 无法判定
       return err / static_cast<double>(cnt);
     }
 
@@ -378,6 +383,11 @@ namespace training
 
     Eigen::Vector3d center() const { return Eigen::Vector3d(x_(0), x_(2), x_(7)); }
     double radius() const { return x_(6); }
+    // r 是否落在可信区间（撞到 clamp 说明估计发散，此时不该用它外推）
+    bool radius_trusted() const
+    {
+      return x_(6) > kTrustRadiusLo && x_(6) < kTrustRadiusHi;
+    }
     double omega() const { return x_(5); }
     double phase() const { return x_(4); }
 
@@ -399,6 +409,7 @@ namespace training
       x_(8) = std::clamp(x_(8), -kMaxVz, kMaxVz);
     }
 
+    bool fixed_radius_{false};
     bool initialized_{false};
     double q_center_{1.0}, q_theta_{0.30}, q_omega_{0.60}, q_radius_{0.02};
     double q_z_{0.02}, r_meas_{0.05};

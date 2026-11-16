@@ -1,8 +1,3 @@
-/*
-lesson4 实现
-参考同济大学开源项目 sp_vision_35
-*/
-
 #include "lessons.hpp"
 #include "debug_flags.hpp"
 #include "ballistics.hpp"
@@ -12,6 +7,7 @@ lesson4 实现
 
 #include <algorithm>
 #include <cstdlib>
+#include <deque>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -64,7 +60,7 @@ namespace training
     // 关键：configure() 之前从未被调用，滤波器一直用默认 q_accel=8 m/s²，
     // 意味着每帧速度允许抖动 √(q·dt) ≈ 0.68 m/s，
     // 预测 250 ms 时被放大成 ±170 mm —— 这就是"静止靶也抖"的根因。
-    constexpr double kQAccel{0.30};   // 水平加速度标准差 m/s²
+    constexpr double kQAccel{0.60};   // 水平加速度标准差 m/s²
     constexpr double kRPosInit{0.08}; // 初始量测标准差 m（之后被 set_R 覆盖）
     constexpr double kQAccelZ{0.02};  // 垂直加速度噪声（几乎为 0：地面机器人不做垂直机动）
     constexpr double kQTheta{0.05};   // 航向抖动 rad
@@ -124,7 +120,7 @@ namespace training
     //   横向 σ_lat = Z·σ_px/fx        （∝ Z）
     //   深度 σ_dep = Z²·σ_px/(fx·W)   （∝ Z²，且与板宽 W 成反比）
     // 2 m、小板(135 mm)、σ_px=3 px：σ_lat≈4.6 mm，σ_dep≈82 mm（实测 80 mm）
-    constexpr double kCornerNoisePx{3.0};
+    constexpr double kCornerNoisePx{5.0};
     constexpr double kSigLatMin{0.002};
     constexpr double kSigLatMax{0.05};
     constexpr double kSigDepMin{0.01};
@@ -253,20 +249,29 @@ namespace training
       return true;
     }
     // 相机系 -> 云台系 -> 世界系
-    // 云台系 → 世界系。
-    // 说明：**瞄准链路已不再依赖它**（lesson05 用云台系位置 + 角度增量），
-    // 这里只影响日志与旋转模型的外推，保持最朴素的 R(imu_q) 并由偏置微调。
+    // 云台系 → 世界系（模式可选，见 training::g_g2w_mode）
     Eigen::Matrix3d r_gimbal_to_world(const Eigen::Quaterniond &imu_q)
     {
-      const double off = training::g_gimbal_yaw_offset;
-      if (std::abs(off) < 1e-9)
-        return imu_q.toRotationMatrix();
-      Eigen::Matrix3d Rz = Eigen::Matrix3d::Identity();
-      Rz(0, 0) = std::cos(off);
-      Rz(0, 1) = -std::sin(off);
-      Rz(1, 0) = std::sin(off);
-      Rz(1, 1) = std::cos(off);
-      return Rz * imu_q.toRotationMatrix();
+      const Eigen::Matrix3d R = imu_q.toRotationMatrix();
+      switch (training::g_g2w_mode)
+      {
+      case 0:
+        return R;
+      case 2:
+      case 3:
+      {
+        const double off = (training::g_g2w_mode == 2 ? 1.0 : -1.0) * M_PI / 2;
+        Eigen::Matrix3d Rz = Eigen::Matrix3d::Identity();
+        Rz(0, 0) = std::cos(off);
+        Rz(0, 1) = -std::sin(off);
+        Rz(1, 0) = std::sin(off);
+        Rz(1, 1) = std::cos(off);
+        return Rz * R;
+      }
+      case 1:
+      default:
+        return R.transpose();
+      }
     }
 
     Eigen::Vector3d to_world(const Eigen::Vector3d &p_cam,
@@ -310,6 +315,7 @@ namespace training
     // 本帧没有有效观测时的统一降级（检测为空/PnP 失败）
     const auto degrade = [&state]() -> std::optional<Target>
     {
+      state.selected_idx = -1; // 本帧没有真正选中任何板（日志据此判断）
       if (state.phase == TrackingState::Phase::kTracking ||
           state.phase == TrackingState::Phase::kTempLost)
       {
@@ -696,6 +702,43 @@ namespace training
            calibration.camera_to_gimbal.cols() == 3)
               ? calibration.camera_to_gimbal
               : Eigen::Matrix3d::Identity();
+      if (calibration.camera_to_gimbal.rows() == 3 &&
+          calibration.camera_to_gimbal.cols() == 3)
+      {
+        training::g_camera_to_gimbal = calibration.camera_to_gimbal;
+        training::g_calibration_valid = true;
+      }
+      training::g_target_cam = p_cam;
+      training::g_target_cam_valid = true;
+
+      // 相机系速度：最近 6 帧最小二乘（不经过世界系，方向不会被坐标偏置带歪）
+      {
+        static std::deque<std::pair<double, Eigen::Vector3d>> hist;
+        const double t_now =
+            std::chrono::duration<double>(timestamp.time_since_epoch()).count();
+        hist.emplace_back(t_now, p_cam);
+        while (hist.size() > 6)
+          hist.pop_front();
+
+        if (hist.size() >= 3)
+        {
+          const double t0 = hist.front().first;
+          double sx = 0, sxx = 0;
+          Eigen::Vector3d sp = Eigen::Vector3d::Zero(), sxp = Eigen::Vector3d::Zero();
+          for (const auto &h : hist)
+          {
+            const double t = h.first - t0;
+            sx += t;
+            sxx += t * t;
+            sp += h.second;
+            sxp += t * h.second;
+          }
+          const double n = static_cast<double>(hist.size());
+          const double den = n * sxx - sx * sx;
+          if (std::abs(den) > 1e-9)
+            training::g_target_cam_vel = (n * sxp - sx * sp) / den;
+        }
+      }
       training::g_target_gimbal =
           R_c2g_e * p_cam + calibration.camera_to_gimbal_translation;
       const Eigen::Vector3d v_world = state.velocity;
@@ -712,9 +755,16 @@ namespace training
       pp.rho = 1.225;
       pp.drag = g_ballistics_drag;           // 空气阻力开关
       pp.latency = state.pipeline_latency_s; // 处理+开火延迟
-      const Eigen::Matrix3d R_g2w = r_gimbal_to_world(imu_q);
-      const Eigen::Vector3d p_g = R_g2w.transpose() * state.position;
-      const Eigen::Vector3d v_g = R_g2w.transpose() * state.velocity;
+      // 用 PnP 直接得到的云台系位置，避免世界系换算误差污染瞄准
+      const Eigen::Matrix3d R_c2g_b =
+          (calibration.camera_to_gimbal.rows() == 3 &&
+           calibration.camera_to_gimbal.cols() == 3)
+              ? calibration.camera_to_gimbal
+              : Eigen::Matrix3d::Identity();
+      const Eigen::Vector3d p_g =
+          R_c2g_b * p_cam + calibration.camera_to_gimbal_translation;
+      const Eigen::Vector3d v_g =
+          r_gimbal_to_world(imu_q).transpose() * state.velocity;
 
       const AimSolution aim = solve_aim(p_g, v_g, pp);
       state.aim_valid = aim.ok;
@@ -723,7 +773,7 @@ namespace training
         state.aim_yaw = aim.yaw;
         state.aim_pitch = aim.pitch;
         state.aim_tau = aim.tau;
-        state.aim_point = R_g2w * aim.hit; // 击打点转回世界系
+        state.aim_point = r_gimbal_to_world(imu_q) * aim.hit; // 击打点转回世界系
       }
     }
 

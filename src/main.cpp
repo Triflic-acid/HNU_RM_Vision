@@ -88,21 +88,29 @@ namespace
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
   }
 
-  // 云台系 → 世界系：R_gimbal2world = R_gimbal2imubody^T · R_imubody2imuabs
+  // 云台系 → 世界系（模式见 training::g_g2w_mode，k 键切换）
   Eigen::Matrix3d r_gimbal_to_world(const Eigen::Quaterniond &imu_q)
   {
-    Eigen::Matrix3d R_b2a = Eigen::Matrix3d::Identity();
-    const double off = training::g_gimbal_yaw_offset;
-    if (std::abs(off) > 1e-9)
+    const Eigen::Matrix3d R = imu_q.toRotationMatrix();
+    switch (training::g_g2w_mode)
     {
+    case 0:
+      return R;
+    case 2:
+    case 3:
+    {
+      const double off = (training::g_g2w_mode == 2 ? 1.0 : -1.0) * M_PI / 2;
       Eigen::Matrix3d Rz = Eigen::Matrix3d::Identity();
       Rz(0, 0) = std::cos(off);
       Rz(0, 1) = -std::sin(off);
       Rz(1, 0) = std::sin(off);
       Rz(1, 1) = std::cos(off);
-      R_b2a = Rz * R_b2a;
+      return Rz * R;
     }
-    return imu_q.toRotationMatrix().transpose() * R_b2a;
+    case 1:
+    default:
+      return R.transpose();
+    }
   }
 
   // 世界系点 → 像素。用于把弹道解算出的击打点画到画面上。
@@ -529,6 +537,7 @@ namespace training::dbg
   bool demo_write{false}; // 演示：无视算法输出，向云台发出按正弦函数运动的指令
   bool truth{true};       // 返回仿真器数据
   bool pred_log{true};    // 输出预测值 & 真实值日志（依赖 truth）
+  bool aim{true};         // [aim] 第五讲云台角/偏差/指令打点（每 15 帧）
 } // namespace training::dbg
 
 int main(int argc, char **argv)
@@ -652,6 +661,32 @@ int main(int argc, char **argv)
           d.center = filtered;
       }
 
+      // 坐标系诊断：目标静止时，正确模式下 p_world 的抖动应最小
+      {
+        static std::deque<Eigen::Vector3d> recent;
+        static int diag_n = 0;
+        if (tracking.phase == training::TrackingState::Phase::kTracking)
+        {
+          recent.push_back(tracking.position);
+          while (recent.size() > 60)
+            recent.pop_front();
+        }
+        if (++diag_n % 60 == 0 && recent.size() == 60)
+        {
+          Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+          for (const auto &p : recent)
+            mean += p;
+          mean /= static_cast<double>(recent.size());
+          double var = 0.0;
+          for (const auto &p : recent)
+            var += (p - mean).squaredNorm();
+          const double sd = std::sqrt(var / static_cast<double>(recent.size()));
+          std::printf("[tf] mode=%d  p_world=(%+.2f,%+.2f,%+.2f)  std=%.0f mm\n",
+                      training::g_g2w_mode, mean.x(), mean.y(), mean.z(), sd * 1000.0);
+          std::fflush(stdout);
+        }
+      }
+
       // 计时
       last_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
@@ -744,6 +779,11 @@ int main(int argc, char **argv)
       }
 
       // lesson5 开火
+      // 丢目标时续发用的"最后一条有效指令"
+      static training::Command last_cmd{};
+      static bool has_last{false};
+      static training::TimePoint last_t{};
+
       if (target)
       {
         // 把当前云台角同步给 lesson05（开火门控用）
@@ -751,7 +791,10 @@ int main(int argc, char **argv)
         {
           const Eigen::Matrix3d R = input->imu_q.toRotationMatrix();
           training::g_gimbal_yaw = std::atan2(R(1, 0), R(0, 0));
-          training::g_gimbal_pitch = -std::asin(std::clamp(R(2, 0), -1.0, 1.0));
+          // imu_q = Rz(yaw)·Ry(−pitch)·Rx(roll)  ⇒  R(2,0) = sin(pitch)
+          // 所以直接 asin 就得到 pitch。之前多了一个负号，导致
+          // g_gimbal_pitch 与 [IO] 打印的 pitch 反号 → 伺服环越跑越抬头。
+          training::g_gimbal_pitch = std::asin(std::clamp(R(2, 0), -1.0, 1.0));
         }
 
         // 标定打印：目标在云台系/世界系的方位，以及解算出来的瞄准角
@@ -775,6 +818,25 @@ int main(int argc, char **argv)
         command = training::lesson05_aiming(*target,
                                             input->timestamp,
                                             input->bullet_speed);
+
+        // 记录最后一条有效指令，供丢目标时续发
+        if (command.control && std::isfinite(command.yaw) && std::isfinite(command.pitch))
+        {
+          last_cmd = command;
+          has_last = true;
+          last_t = std::chrono::steady_clock::now();
+        }
+      }
+      else if (has_last &&
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - last_t)
+                       .count() < 0.5)
+      {
+        // ---- 丢目标时的指令保持（通讯层，关键）----
+        // 仿真器收到 target_state == 0 会把 target_angles 置空 → 云台**停在原地**，
+        // 于是"有目标→无目标→有目标"会让云台走走停停、永远收敛不到位。
+        // 这里在丢目标 0.5 s 内继续发送上一条有效指令（control=true），把动作走完。
+        command = last_cmd;
+        command.shoot = false;
       }
 
       // 250 ms 前对当前状态的预测值与当前测量值的对比
@@ -892,11 +954,12 @@ int main(int argc, char **argv)
                                                                : "off";
         char hud[200];
         std::snprintf(hud, sizeof(hud),
-                      "[%s] %zu targets  %.1fms  ROI:%s  refine:%s  drag:%s  n:%dms  m:mode z:roi p:refine d:drag",
+                      "[%s] %zu targets  %.1fms  ROI:%s  refine:%s  drag:%s  n:%dms  poff:%+.1f°  m:mode z:roi p:refine d:drag u/i:pitch",
                       mode == training::DetMode::kArmor ? "ARMOR" : "RUNE",
                       detections.size(), last_ms, roi_txt, refine_name(refine_mode),
                       training::g_ballistics_drag ? "on" : "off",
-                      static_cast<int>(training::g_pred_lead_s * 1000.0 + 0.5));
+                      static_cast<int>(training::g_pred_lead_s * 1000.0 + 0.5),
+                      training::g_pitch_offset * 180.0 / M_PI);
         cv::putText(canvas, hud, cv::Point(12, 26), cv::FONT_HERSHEY_SIMPLEX, 0.65,
                     mode == training::DetMode::kArmor ? cv::Scalar(0, 255, 0)
                                                       : cv::Scalar(0, 128, 255),
@@ -942,6 +1005,37 @@ int main(int argc, char **argv)
       {
         training::g_gimbal_yaw_offset = 0.0;
         log_gui("\\", "云台偏置", "复位 0°");
+      }
+      else if (key == 'u' || key == 'U' || key == 'i' || key == 'I')
+      {
+        const double step = (key == 'u' || key == 'U') ? -1.0 : 1.0;
+        training::g_pitch_offset += step * M_PI / 180.0;
+        char buf[40];
+        std::snprintf(buf, sizeof(buf), "%+.1f°",
+                      training::g_pitch_offset * 180.0 / M_PI);
+        log_gui(key == 'u' ? "u" : "i", "pitch 偏置", buf);
+      }
+      else if (key == 'o' || key == 'O')
+      {
+        training::g_pitch_offset = 0.0;
+        training::g_yaw_offset = 0.0;
+        log_gui("o", "瞄准偏置", "复位 0°");
+      }
+      else if (key == 'j' || key == 'J')
+      {
+        static const double steps[] = {0.5, 1.0, 2.0, 2.5};
+        static int idx = 1; // 默认 1.0 rad/s
+        idx = (idx + 1) % 4;
+        training::g_gimbal_max_rate = steps[idx];
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.1f rad/s", steps[idx]);
+        log_gui("j", "云台限速", buf);
+      }
+      else if (key == 'k' || key == 'K')
+      {
+        training::g_g2w_mode = (training::g_g2w_mode + 1) % 4;
+        static const char *nm[] = {"R", "R^T", "Rz(+90)R", "Rz(-90)R"};
+        log_gui("k", "云台→世界 模式", nm[training::g_g2w_mode]);
       }
       else if (key == 'n' || key == 'N')
       {

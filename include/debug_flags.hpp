@@ -12,4 +12,7 @@ namespace training::dbg
 
     extern bool truth;    // 返回仿真器数据，严禁在实车上开启
     extern bool pred_log; // 输出预测值 & 真实值日志（真实值依赖 truth）
+
+    // [aim] 第五讲：云台角、目标偏差、弹道补偿、最终指令（每 15 帧一行）
+    extern bool aim; // 输出预测值 & 真实值日志（真实值依赖 truth）
 } // namespace training::dbg

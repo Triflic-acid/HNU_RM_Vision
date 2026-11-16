@@ -212,7 +212,7 @@ namespace training::io
     if (!active)
     {
       msg.target_state.data = hnurm_interfaces::msg::TargetState::LOST_TARGET;
-      msg.yaw = 0.0F;
+      msg.yaw = -25.0F;
       msg.pitch = 0.0F;
       msg.target_distance = 0.0F;
     }

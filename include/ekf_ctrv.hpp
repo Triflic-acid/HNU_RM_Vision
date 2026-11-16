@@ -51,6 +51,10 @@ namespace training
     using Mat7 = Eigen::Matrix<double, 7, 7>;
 
     // 直接给定量测协方差（世界系 3x3），与 KalmanCV::set_R 语义一致
+    // 自适应过程噪声开关（默认开）
+    void set_adaptive(bool on) { adaptive_ = on; }
+    double q_scale() const { return q_adapt_; }
+
     void set_R(const Eigen::Matrix3d &R)
     {
       R_ = 0.5 * (R + R.transpose());
@@ -140,6 +144,27 @@ namespace training
       const Eigen::Matrix3d &R = R_;
       Eigen::Vector3d y = p - H * x_;
 
+      // ---- 自适应过程噪声 ----
+      // 平移靶是正弦运动（幅度 0.5 m、周期 4 s → 最大加速度 ≈ 1.2 m/s²），
+      // 固定 q_accel=0.3 会明显迟滞；但单纯调大 q 又会让静止靶抖。
+      // 做法：看新息（残差）的大小动态调 q —— 大残差说明机动，放大 q 追上去；
+      //       小残差说明平稳，缩小 q 平滑输出。
+      if (adaptive_)
+      {
+        // 按**估计速度**自适应（比按新息稳定）：
+        //   几乎静止 → q 收紧到 0.55 倍（抗抖动）
+        //   明显运动 → q 放大到 2.2 倍（减 250 ms 外推的迟滞）
+        const double sp = std::hypot(x_(2) * std::cos(x_(3)), x_(2) * std::sin(x_(3)));
+        const double t = std::clamp((sp - 0.15) / (0.60 - 0.15), 0.0, 1.0);
+        const double gain = 0.55 + (2.2 - 0.55) * t;
+        q_adapt_ = 0.85 * q_adapt_ + 0.15 * gain;
+        q_accel_eff_ = q_accel_xy_ * q_adapt_;
+      }
+      else
+      {
+        q_accel_eff_ = q_accel_xy_;
+      }
+
       const Eigen::Matrix3d S = H * P_ * H.transpose() + R;
       const Eigen::Matrix<double, 7, 3> K = P_ * H.transpose() * S.inverse();
 
@@ -208,7 +233,7 @@ namespace training
     Mat7 process_noise(double dt) const
     {
       Mat7 Q = Mat7::Zero();
-      const double qxy = q_accel_xy_ * q_accel_xy_;
+      const double qxy = q_accel_eff_ * q_accel_eff_;
       const double qz = q_accel_z_ * q_accel_z_;
 
       Q(0, 0) = qxy * dt * dt * dt / 3.0;
@@ -228,6 +253,9 @@ namespace training
 
     bool initialized_{false};
     double q_accel_xy_{6.0};
+    double q_accel_eff_{6.0}; // 当前生效的（自适应后）
+    bool adaptive_{true};
+    double q_adapt_{1.0}; // 增益，1.0 = 不调整
     double q_accel_z_{2.0};
     double q_theta_{0.05};
     double q_omega_{4.0};

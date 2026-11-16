@@ -5,6 +5,7 @@ lesson4 实现
 
 #include "lessons.hpp"
 #include "debug_flags.hpp"
+#include "ballistics.hpp"
 #include "kalman_cv.hpp"
 
 #include <opencv2/calib3d.hpp>
@@ -68,27 +69,30 @@ namespace training
     constexpr double kQTheta{0.05};   // 航向抖动 rad
     constexpr double kQOmega{0.40};   // 角加速度噪声 rad/s²（2.0 时 ω 被噪声带跑）
 
-    // 装甲环半径先验（m）：按编号给。实车需逐车型标定；仿真按模型尺寸填。
-    // 用途：CTRV/圆周模型里 r 的初值；在线估计只在弧覆盖 ≥180° 时才修正它。
+    // 车体上的装甲板块数。参考同济 sp_vision_25 的 set_target()：
+    //   · 平衡步兵（大板 + 3/4/5 号）      r=0.2000, N=2
+    //   · 前哨站                          r=0.2765, N=3
+    //   · 基地                            r=0.3205, N=3
+    //   · 普通步兵/英雄/哨兵               r=0.2000, N=4
+    // 注意 N 真的不总是 4 —— 平衡步兵只有 2 块。
+    int armor_count(int class_id, bool large_armor)
+    {
+      if (large_armor && (class_id == 3 || class_id == 4 || class_id == 5))
+        return 2; // 平衡步兵
+      if (class_id == 0)
+        return 3; // 前哨站
+      return 4;
+    }
+
+    // 装甲环半径先验（m），数值取自同济 sp_vision_25 的实车配置：
+    //   普通车 0.20 / 前哨站 0.2765 / 基地 0.3205
+    // 用途：圆周 EKF 里 r 的初值。
     double armor_ring_prior(int class_id)
     {
-      switch (class_id)
-      {
-      case 1:
-        return 0.24; // 英雄
-      case 2:
-        return 0.22; // 工程
-      case 3:
-      case 4:
-      case 5:
-        return 0.20; // 步兵
-      case 7:
-        return 0.26; // 哨兵
-      case 0:
-        return 0.30; // 前哨站
-      default:
-        return 0.20;
-      }
+      // 数值来自同济 sp_vision_25 的实际配置（普通 0.2 / 前哨站 0.2765）
+      if (class_id == 0)
+        return 0.2765; // 前哨站
+      return 0.2000;   // 其余
     }
 
     // 预测位移上限：速度估计有噪声时，0.25 s 外推会把误差放大成米级跳变
@@ -99,7 +103,9 @@ namespace training
     // 切板死区：新候选正面度必须比锁定板高这么多才切（0.17 ≈ 10°）
     constexpr double kSwitchDeadZone{0.17};
     // 旋转 EKF：omega 超过它才认为是旋转靶；装甲板 yaw 的量测噪声
-    constexpr bool kEnableSpinEkf{false};   // 旋转 EKF 开关（实测比 CTRV 差，关闭）
+    // 整车观测（多板圆周 EKF）。打开后旋转段用它的预测；关闭则退回纯 CTRV。
+    constexpr bool kOnlineArmorNum{false}; // 板数在线判别（默认关：单板时不可辨识，易抖动）
+    constexpr bool kEnableSpinEkf{true};
     constexpr double kSpinOmegaThresh{1.0}; // rad/s
     constexpr double kAngleSigma{0.20};     // rad
     constexpr double kDistRatioMax{1.8};    // PnP 距离 / 单目距离 上限
@@ -195,8 +201,6 @@ namespace training
     // 对单块板做PnP：返回是否成功
     bool solve_armor(const Detection &d,
                      const CameraCalibration &cal,
-                     const cv::Vec3d &rvec_prev,
-                     bool has_prev,
                      cv::Vec3d &rvec,
                      cv::Vec3d &tvec,
                      double &err_px)
@@ -216,11 +220,7 @@ namespace training
       }
       if (rvecs.empty())
         return false;
-      // 暂时关闭双解消歧：只按重投影误差选最小（保留 IPPE 的两个解，但不用法向判据）
-      // 参数 rvec_prev / has_prev 保留是为了不改调用点，当前不参与判定
-      (void)rvec_prev;
-      (void)has_prev;
-
+      // 双解消歧当前关闭：只按重投影误差选最小（见文档"已知问题"）
       double best{1e9};
       bool found{false};
 
@@ -367,12 +367,8 @@ namespace training
     // 2. PnP解算
     cv::Vec3d rvec, tvec;
     double err_px{0.0};
-    if (!solve_armor(d, calibration, state.last_rvec, state.has_rvec,
-                     rvec, tvec, err_px))
+    if (!solve_armor(d, calibration, rvec, tvec, err_px))
       return degrade(); // PnP 失败返回本帧无有效观测
-
-    state.last_rvec = rvec;
-    state.has_rvec = true;
 
     // 3. 坐标变换
     const Eigen::Vector3d p_cam(tvec[0], tvec[1], tvec[2]);
@@ -420,8 +416,7 @@ namespace training
         const double dq = state.prev_q.angularDistance(imu_q); // rad，两帧转角
         const double dtq =
             std::max(std::chrono::duration<double>(timestamp - state.prev_q_stamp).count(), 1e-3);
-        const double rate = dq / dtq; // rad/s
-        state.gimbal_rate = rate;
+        const double rate = dq / dtq;                     // rad/s
         inflate = 1.0 + std::clamp(rate / 2.0, 0.0, 8.0); // 2 rad/s 起明显放大
       }
       state.prev_q = imu_q;
@@ -434,7 +429,7 @@ namespace training
     }
 
     // 4. 选板
-    // 编号会抖，不能只看 class_id：
+    // 编号会抖（实测 310 次换号里 142 次位置几乎没动），所以不能只看 class_id：
     // 位置极近时视为同一块，即使编号变了。
     const float px_shift = (state.target_px.x >= 0.0F)
                                ? static_cast<float>(cv::norm(px - state.target_px))
@@ -531,22 +526,44 @@ namespace training
 
     // 6. 返回预测框 & 250ms历史数据
     // 旋转模型**默认关闭**。实测（outputs/history）旋转段位移 90 分位：
-    // 仅 CTRV ：87~177 mm <- 最好
-    // 旋转 EKF ：672~845 mm <- 更差
+    //   仅 CTRV        ：87~177 mm   ← 最好
+    //   + 旋转 EKF     ：672~845 mm  ← 更差
     // 所以统一用 CTRV 出预测；旋转 EKF 代码保留，改开关即可对比。
     if (kEnableSpinEkf)
     {
-      const Eigen::Vector3d c_for_yaw = state.spin_ekf.initialized()
-                                            ? state.spin_ekf.center()
-                                            : p_world;
-      const double plate_yaw = armor_yaw_world(rvec, calibration, imu_q, c_for_yaw, p_world);
+      // 整车观测：把当帧**所有**可见板都做一次 PnP，一起喂给圆周 EKF。
+      // 一块板转走/换板时，另一块仍在约束车的中心/转速，跳变被吸收。
       if (!state.spin_ekf.initialized())
       {
         state.spin_ekf.set_prior_radius(armor_ring_prior(d.class_id));
         state.spin_ekf.init(p_world);
       }
       state.spin_ekf.predict(dt);
-      state.spin_ekf.update_with_angle(p_world, plate_yaw, kAngleSigma);
+
+      const int N = armor_count(d.class_id, d.large_armor);
+      std::vector<EkfSpin::PlateObs> plates;
+      plates.reserve(detections.size());
+      for (const auto &d2 : detections)
+      {
+        if (d2.box.width < kMinBoxPx)
+          continue;
+        cv::Vec3d rv2, tv2;
+        double e2 = 0.0;
+        if (!solve_armor(d2, calibration, rv2, tv2, e2))
+          continue;
+        const Eigen::Vector3d p2(tv2[0], tv2[1], tv2[2]);
+        const Eigen::Vector3d w2 = to_world(p2, calibration, imu_q);
+        EkfSpin::PlateObs o;
+        o.p = w2;
+        o.yaw = armor_yaw_world(rv2, calibration, imu_q, state.spin_ekf.center(), w2);
+        o.sigma_a = kAngleSigma;
+        plates.push_back(o);
+      }
+      // 板数：先按车型给初值；在线判别默认关闭（见文档"板数辨识"一节）
+      state.spin_ekf.set_armor_num(N);
+      if (kOnlineArmorNum)
+        state.spin_ekf.set_armor_num_candidates({3, 4});
+      state.spin_ekf.update_multi(plates, N);
 
       const double w_spin = state.spin_ekf.omega();
       state.spin_active = std::abs(w_spin) > kSpinOmegaThresh;
@@ -620,6 +637,28 @@ namespace training
       state.cv_has_pred = false;
     }
 
+    // 弹道解算
+    // 参考：北工大 - 弹道解算及云台角度求解算法
+    // 目标世界状态转到云台系 → Newton 解 (yaw, pitch, τ) → 输出击打点
+    {
+      ProjectileParams pp;
+      pp.v0 = 25.0;                          // 先用仿真默认弹速
+      pp.latency = state.pipeline_latency_s; // 处理+开火延迟
+      const Eigen::Matrix3d R_g2w = imu_q.toRotationMatrix();
+      const Eigen::Vector3d p_g = R_g2w.transpose() * state.position;
+      const Eigen::Vector3d v_g = R_g2w.transpose() * state.velocity;
+
+      const AimSolution aim = solve_aim(p_g, v_g, pp);
+      state.aim_valid = aim.ok;
+      if (aim.ok)
+      {
+        state.aim_yaw = aim.yaw;
+        state.aim_pitch = aim.pitch;
+        state.aim_tau = aim.tau;
+        state.aim_point = R_g2w * aim.hit; // 击打点转回世界系
+      }
+    }
+
     state.pred_hist.push_back({timestamp, p_pred,
                                d.class_id, static_cast<float>(d.confidence), d.box.width,
                                static_cast<float>(state.distance_m),
@@ -631,7 +670,11 @@ namespace training
                                static_cast<float>(state.velocity.z()),
                                static_cast<float>(state.spin_ekf.radius()),
                                state.spin_active ? 1 : 0,
-                               static_cast<float>(state.pipeline_latency_s * 1000.0)});
+                               static_cast<float>(state.pipeline_latency_s * 1000.0),
+                               static_cast<float>(state.aim_point.x()),
+                               static_cast<float>(state.aim_point.y()),
+                               static_cast<float>(state.aim_point.z()),
+                               static_cast<float>(state.aim_tau)});
     while (state.pred_hist.size() > 64)
     {
       state.pred_hist.pop_front();

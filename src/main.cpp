@@ -6,6 +6,7 @@
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
 
 #include <cstdio>
 #include <csignal>
@@ -83,6 +84,61 @@ namespace
     cv::putText(canvas, "cv 250ms",
                 cv::Point(cvRound(st.cv_pred_corners[0].x), cvRound(st.cv_pred_corners[0].y) - 24),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
+  }
+
+  // 世界系点 → 像素。用于把弹道解算出的击打点画到画面上。
+  bool world_to_pixel(const Eigen::Vector3d &p_world,
+                      const Eigen::Quaterniond &imu_q,
+                      const training::CameraCalibration &cal,
+                      cv::Point2f &px)
+  {
+    if (!cal.valid())
+      return false;
+    const Eigen::Matrix3d R_g2w = imu_q.toRotationMatrix();
+    const Eigen::Vector3d p_g = R_g2w.transpose() * p_world; // → 云台系
+    const Eigen::Vector3d p_c = cal.camera_to_gimbal.transpose() *
+                                (p_g - cal.camera_to_gimbal_translation); // → 相机系
+    if (p_c.z() <= 0.1)
+      return false; // 在相机后方
+
+    std::vector<cv::Point3f> obj{cv::Point3f(static_cast<float>(p_c.x()),
+                                             static_cast<float>(p_c.y()),
+                                             static_cast<float>(p_c.z()))};
+    std::vector<cv::Point2f> img;
+    cv::projectPoints(obj, cv::Vec3d(0, 0, 0), cv::Vec3d(0, 0, 0),
+                      cal.matrix, cal.distortion, img);
+    if (img.empty())
+      return false;
+    px = img[0];
+    return true;
+  }
+
+  // 击打点：蓝色准星 + yaw/pitch/τ 文字
+  void draw_aim_point(cv::Mat &canvas, const training::TrackingState &st,
+                      const Eigen::Quaterniond &imu_q,
+                      const training::CameraCalibration &cal)
+  {
+    if (!st.aim_valid)
+      return;
+
+    cv::Point2f px;
+    if (!world_to_pixel(st.aim_point, imu_q, cal, px))
+      return;
+    if (px.x < 0 || px.y < 0 || px.x >= canvas.cols || px.y >= canvas.rows)
+      return;
+
+    const cv::Scalar kBlue(255, 128, 0); // BGR
+    const cv::Point c(cvRound(px.x), cvRound(px.y));
+    cv::drawMarker(canvas, c, kBlue, cv::MARKER_CROSS, 26, 2, cv::LINE_AA);
+    cv::circle(canvas, c, 11, kBlue, 2, cv::LINE_AA);
+
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "AIM %.2f %.2f %.0fms",
+                  st.aim_yaw * 180.0 / M_PI,
+                  st.aim_pitch * 180.0 / M_PI,
+                  st.aim_tau * 1000.0);
+    cv::putText(canvas, buf, c + cv::Point(16, -14),
+                cv::FONT_HERSHEY_SIMPLEX, 0.55, kBlue, 2, cv::LINE_AA);
   }
 
   // 打符：叶片四角 + 靶心 + 圆心
@@ -658,6 +714,7 @@ int main(int argc, char **argv)
           draw_armors(canvas, detections);
           draw_prediction(canvas, tracking);
           draw_cv_prediction(canvas, tracking);
+          draw_aim_point(canvas, tracking, input->imu_q, calibration);
         }
         else
         {

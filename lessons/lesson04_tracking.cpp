@@ -60,11 +60,15 @@ namespace training
     // 关键：configure() 之前从未被调用，滤波器一直用默认 q_accel=8 m/s²，
     // 意味着每帧速度允许抖动 √(q·dt) ≈ 0.68 m/s，
     // 预测 250 ms 时被放大成 ±170 mm —— 这就是"静止靶也抖"的根因。
-    constexpr double kQAccel{0.60};   // 水平加速度标准差 m/s²
-    constexpr double kRPosInit{0.08}; // 初始量测标准差 m（之后被 set_R 覆盖）
-    constexpr double kQAccelZ{0.02};  // 垂直加速度噪声（几乎为 0：地面机器人不做垂直机动）
-    constexpr double kQTheta{0.05};   // 航向抖动 rad
-    constexpr double kQOmega{0.40};   // 角加速度噪声 rad/s²（2.0 时 ω 被噪声带跑）
+    constexpr double kQAccel{0.60};
+    // ---- 整车运动状态判定的门限 ----
+    constexpr double kStaticSpeed{0.15};    // m/s，低于它认为静止
+    constexpr double kSpinOmegaDetect{1.0}; // rad/s，高于它认为自旋
+    constexpr int kMotionVotes{8};          // 连续 8 帧一致才切换状态   // 水平加速度标准差 m/s²
+    constexpr double kRPosInit{0.08};       // 初始量测标准差 m（之后被 set_R 覆盖）
+    constexpr double kQAccelZ{0.02};        // 垂直加速度噪声（几乎为 0：地面机器人不做垂直机动）
+    constexpr double kQTheta{0.05};         // 航向抖动 rad
+    constexpr double kQOmega{0.40};         // 角加速度噪声 rad/s²（2.0 时 ω 被噪声带跑）
 
     // 车体上的装甲板块数。参考同济 sp_vision_25 的 set_target()：
     //   · 平衡步兵（大板 + 3/4/5 号）      r=0.2000, N=2
@@ -554,6 +558,64 @@ namespace training
     state.position = state.ekf.position();
     state.velocity = state.ekf.velocity();
     state.spin_rate = state.ekf.turn_rate(); // rad/s，供日志/诊断
+
+    // ================= 整车运动状态判定 =================
+    // 依据两个与坐标系无关的量：|v|（旋转不改变模长）和 |ω|（EKF/圆周模型给出）。
+    //   静止：|v| < kStaticSpeed                     → 用匀速卡尔曼（CV）出状态
+    //   自旋：|ω| > kSpinOmega                       → CTRV + 圆周模型出预测
+    //   平移：其余                                  → CTRV
+    // 用"连续 kMotionVotes 帧一致才切换"做迟滞，避免抖动。
+    {
+      const double speed = state.velocity.norm();
+      const double omega = std::abs(state.spin_ekf.initialized() ? state.spin_ekf.omega()
+                                                                 : state.spin_rate);
+
+      TrackingState::Motion want = TrackingState::Motion::kMoving;
+      if (omega > kSpinOmegaDetect)
+        want = TrackingState::Motion::kSpinning;
+      else if (speed < kStaticSpeed)
+        want = TrackingState::Motion::kStatic;
+
+      if (want == state.motion)
+      {
+        state.motion_votes = 0;
+      }
+      else if (++state.motion_votes >= kMotionVotes)
+      {
+        state.motion = want;
+        state.motion_votes = 0;
+        // 静止靶用 CV 滤波器的输出；其余用 CTRV
+        if (want == TrackingState::Motion::kStatic)
+        {
+          if (!state.kf.initialized())
+          {
+            state.kf.configure(kQAccel, kRPosInit);
+            state.kf.init(state.position);
+          }
+          else
+          {
+            state.kf.init(state.position); // 以 CTRV 的结果为起点，避免跳变
+          }
+        }
+      }
+    }
+
+    // 静止靶：用匀速卡尔曼的输出（对静止目标更稳，不引入 ω 的自由度）
+    if (state.motion == TrackingState::Motion::kStatic)
+    {
+      if (!state.kf.initialized())
+        state.kf.init(state.position);
+      state.kf.predict(dt);
+      state.kf.update(p_world);
+      state.cv_position = state.kf.position();
+      state.cv_velocity = state.kf.velocity();
+      state.cv_valid = true;
+      state.position = state.kf.position();
+      state.velocity = state.kf.velocity();
+    }
+
+    // 把判定结果广播给 lesson05（选限速档位/冻结策略）
+    training::g_motion = static_cast<int>(state.motion);
 
     // ---- 对比开关：同时跑匀速卡尔曼，供离线对比（不影响主链路）----
     if (training::dbg::cv_filter)

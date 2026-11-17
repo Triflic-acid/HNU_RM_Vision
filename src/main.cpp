@@ -5,7 +5,7 @@
 #include "debug_flags.hpp"
 #include "talos_truth.hpp"
 
-#include <opencv2/calib3d.hpp> // cv::projectPoints（画蓝准星要用）
+#include <opencv2/calib3d.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -88,7 +88,7 @@ namespace
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
   }
 
-  // 云台系 → 世界系（模式见 training::g_g2w_mode，k 键切换）
+  // 云台系 -> 世界系（模式见 training::g_g2w_mode，k 键切换）
   Eigen::Matrix3d r_gimbal_to_world(const Eigen::Quaterniond &imu_q)
   {
     const Eigen::Matrix3d R = imu_q.toRotationMatrix();
@@ -113,7 +113,7 @@ namespace
     }
   }
 
-  // 世界系点 → 像素。用于把弹道解算出的击打点画到画面上。
+  // 世界系点 -> 像素。用于把弹道解算出的击打点画到画面上。
   bool world_to_pixel(const Eigen::Vector3d &p_world,
                       const Eigen::Quaterniond &imu_q,
                       const training::CameraCalibration &cal,
@@ -122,9 +122,9 @@ namespace
     if (!cal.valid())
       return false;
     const Eigen::Matrix3d R_g2w = r_gimbal_to_world(imu_q);
-    const Eigen::Vector3d p_g = R_g2w.transpose() * p_world; // → 云台系
+    const Eigen::Vector3d p_g = R_g2w.transpose() * p_world; // -> 云台系
     const Eigen::Vector3d p_c = cal.camera_to_gimbal.transpose() *
-                                (p_g - cal.camera_to_gimbal_translation); // → 相机系
+                                (p_g - cal.camera_to_gimbal_translation); // -> 相机系
     if (p_c.z() <= 0.1)
       return false; // 在相机后方
 
@@ -793,7 +793,7 @@ int main(int argc, char **argv)
           training::g_gimbal_yaw = std::atan2(R(1, 0), R(0, 0));
           // imu_q = Rz(yaw)·Ry(−pitch)·Rx(roll)  ⇒  R(2,0) = sin(pitch)
           // 所以直接 asin 就得到 pitch。之前多了一个负号，导致
-          // g_gimbal_pitch 与 [IO] 打印的 pitch 反号 → 伺服环越跑越抬头。
+          // g_gimbal_pitch 与 [IO] 打印的 pitch 反号 -> 伺服环越跑越抬头。
           training::g_gimbal_pitch = std::asin(std::clamp(R(2, 0), -1.0, 1.0));
         }
 
@@ -832,8 +832,8 @@ int main(int argc, char **argv)
                        .count() < 0.5)
       {
         // ---- 丢目标时的指令保持（通讯层，关键）----
-        // 仿真器收到 target_state == 0 会把 target_angles 置空 → 云台**停在原地**，
-        // 于是"有目标→无目标→有目标"会让云台走走停停、永远收敛不到位。
+        // 仿真器收到 target_state == 0 会把 target_angles 置空 -> 云台**停在原地**，
+        // 于是"有目标->无目标->有目标"会让云台走走停停、永远收敛不到位。
         // 这里在丢目标 0.5 s 内继续发送上一条有效指令（control=true），把动作走完。
         command = last_cmd;
         command.shoot = false;
@@ -954,12 +954,13 @@ int main(int argc, char **argv)
                                                                : "off";
         char hud[200];
         std::snprintf(hud, sizeof(hud),
-                      "[%s] %zu targets  %.1fms  ROI:%s  refine:%s  drag:%s  n:%dms  poff:%+.1f°  m:mode z:roi p:refine d:drag u/i:pitch",
+                      "[%s] %zu targets  %.1fms  ROI:%s  refine:%s  drag:%s  n:%dms  poff:%+.1f°  mot:%s  m:mode z:roi p:refine d:drag u/i:pitch c:calib",
                       mode == training::DetMode::kArmor ? "ARMOR" : "RUNE",
                       detections.size(), last_ms, roi_txt, refine_name(refine_mode),
                       training::g_ballistics_drag ? "on" : "off",
                       static_cast<int>(training::g_pred_lead_s * 1000.0 + 0.5),
-                      training::g_pitch_offset * 180.0 / M_PI);
+                      training::g_pitch_offset * 180.0 / M_PI,
+                      training::g_motion == 0 ? "S" : (training::g_motion == 1 ? "M" : "R"));
         cv::putText(canvas, hud, cv::Point(12, 26), cv::FONT_HERSHEY_SIMPLEX, 0.65,
                     mode == training::DetMode::kArmor ? cv::Scalar(0, 255, 0)
                                                       : cv::Scalar(0, 128, 255),
@@ -1006,6 +1007,11 @@ int main(int argc, char **argv)
         training::g_gimbal_yaw_offset = 0.0;
         log_gui("\\", "云台偏置", "复位 0°");
       }
+      else if (key == 'c' || key == 'C')
+      {
+        training::g_calib = !training::g_calib;
+        log_gui("c", "静态标定", training::g_calib ? "开始（±3° 台阶）" : "结束");
+      }
       else if (key == 'u' || key == 'U' || key == 'i' || key == 'I')
       {
         const double step = (key == 'u' || key == 'U') ? -1.0 : 1.0;
@@ -1023,19 +1029,21 @@ int main(int argc, char **argv)
       }
       else if (key == 'j' || key == 'J')
       {
-        static const double steps[] = {0.5, 1.0, 2.0, 2.5};
-        static int idx = 1; // 默认 1.0 rad/s
+        // 偏航"高档"（平移靶用）分档；俯仰固定 0.15 rad/s 不在这里调
+        static const double steps[] = {0.3, 0.6, 1.0, 1.5};
+        static int idx = 2; // 默认 1.0 rad/s
         idx = (idx + 1) % 4;
-        training::g_gimbal_max_rate = steps[idx];
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%.1f rad/s", steps[idx]);
-        log_gui("j", "云台限速", buf);
+        training::g_yaw_rate_high = steps[idx];
+        char buf[40];
+        std::snprintf(buf, sizeof(buf), "yaw高 %.1f（低 %.1f）",
+                      steps[idx], training::g_yaw_rate_low);
+        log_gui("j", "偏航限速", buf);
       }
       else if (key == 'k' || key == 'K')
       {
         training::g_g2w_mode = (training::g_g2w_mode + 1) % 4;
         static const char *nm[] = {"R", "R^T", "Rz(+90)R", "Rz(-90)R"};
-        log_gui("k", "云台→世界 模式", nm[training::g_g2w_mode]);
+        log_gui("k", "云台->世界 模式", nm[training::g_g2w_mode]);
       }
       else if (key == 'n' || key == 'N')
       {

@@ -165,6 +165,89 @@ namespace training
       elev = std::clamp(elev, -kElevLimit, kElevLimit);
     }
 
+    // ==================== 静态标定模式 ====================
+    // 触发：按 c（main 里置 training::g_calib = true）
+    // 逻辑：对 pitch 注入 +3° / −3° 的台阶，测量 elev 的稳态变化，
+    //       直接算出【环路增益】与【符号】—— 不必再靠猜。
+    //       预期：cmd 增大 ⇒ 光轴下压 ⇒ 目标在画面里"上移" ⇒ elev 增大
+    //            所以正常闭环下 Δelev/Δcmd ≈ +1（同号 = 需要取反才能使误差收敛）
+    //       同时记录"对准时的 gp"，作为零位参考。
+    if (training::g_calib)
+    {
+      static int step = 0;
+      static training::TimePoint t_step{};
+      static double gp0 = 0, elev0 = 0, gp_at = 0, elev_at = 0;
+      const auto now_tp = std::chrono::steady_clock::now();
+      const double el = std::chrono::duration<double>(now_tp - t_step).count();
+
+      Command c;
+      c.control = true;
+      c.shoot = false;
+      c.yaw = training::g_gimbal_yaw; // 标定期间不动 yaw
+
+      switch (step)
+      {
+      case 0: // 记录基准
+        c.pitch = training::g_gimbal_pitch;
+        if (el > 0.6)
+        {
+          gp0 = g_gimbal_pitch;
+          elev0 = elev;
+          step = 1;
+          t_step = now_tp;
+        }
+        break;
+      case 1: // +3°
+        c.pitch = gp0 + 3.0 * M_PI / 180.0;
+        if (el > 0.8)
+        {
+          gp_at = g_gimbal_pitch;
+          elev_at = elev;
+          std::printf("[calib] +3.0°  gp %.2f→%.2f  elev %.2f→%.2f  Δelev/Δcmd = %+.2f\n",
+                      gp0, gp_at, elev0 * 180 / M_PI, elev_at * 180 / M_PI,
+                      (elev_at - elev0) / (3.0 * M_PI / 180.0));
+          step = 2;
+          t_step = now_tp;
+        }
+        break;
+      case 2: // 回基准
+        c.pitch = gp0;
+        if (el > 0.6)
+        {
+          step = 3;
+          t_step = now_tp;
+        }
+        break;
+      case 3: // −3°
+        c.pitch = gp0 - 3.0 * M_PI / 180.0;
+        if (el > 0.8)
+        {
+          gp_at = g_gimbal_pitch;
+          elev_at = elev;
+          std::printf("[calib] -3.0°  gp %.2f→%.2f  elev %.2f→%.2f  Δelev/Δcmd = %+.2f\n",
+                      gp0, gp_at, elev0 * 180 / M_PI, elev_at * 180 / M_PI,
+                      (elev_at - elev0) / (-3.0 * M_PI / 180.0));
+          step = 4;
+          t_step = now_tp;
+        }
+        break;
+      default: // 回基准并结束
+        c.pitch = gp0;
+        if (el > 0.6)
+        {
+          std::printf("[calib] 结束：基准 gp=%.2f°  elev=%.2f°  对准误差=%.2f°\n",
+                      gp0, elev0 * 180 / M_PI, elev0 * 180 / M_PI);
+          std::printf("[calib] 判读：|Δelev/Δcmd|≈1 → 环路耦合正常；"
+                      "符号 + → cmd 与 elev 同向（需取反收敛）；符号 − → 已同向收敛\n");
+          std::fflush(stdout);
+          training::g_calib = false;
+          step = 0;
+        }
+        break;
+      }
+      return c;
+    }
+
     // 弹道补偿：发射仰角 θ 与"直线指向目标"的仰角之差（通常 1~3°）
     const double phi_target = std::atan2(p.z(), std::hypot(p.x(), p.y()));
     double drop = sol.pitch - phi_target;
@@ -200,7 +283,7 @@ namespace training
       else
         cmd.yaw = std::remainder(g_gimbal_yaw + dyaw_total, 2.0 * M_PI);
 
-      cmd.pitch = g_gimbal_pitch + elev + drop;
+      cmd.pitch = g_gimbal_pitch - elev - drop;
     }
     // 符号：反馈与指令同号（kPitchSign = +1，见文件头注释），偏置最后叠加。
     cmd.pitch = kPitchSign * cmd.pitch + training::g_pitch_offset;
@@ -241,6 +324,7 @@ namespace training
       static double prev_pitch = 0.0;
       static training::TimePoint prev_t{};
       static bool valid = false;
+      static int state_lock_frames = 0;
 
       // 首次调用时用当前云台角作为起点，避免从 0 开始慢慢爬
       if (!valid)
@@ -258,12 +342,37 @@ namespace training
         dt = std::chrono::duration<double>(timestamp - prev_t).count();
       dt = std::clamp(dt, 0.005, 0.20);
 
-      const double max_step = training::g_gimbal_max_rate * dt;
+      // ---- 分轴限速 ----
+      // 俯仰：恒定低速（0.15 rad/s）。俯仰对噪声最敏感，一旦被带跑就会"抬头"丢目标。
+      // 偏航：静止/自旋用低档，平移用高档（平移时目标横向移动快，需要跟得上）。
+      const double yaw_rate = (training::g_motion == 1) // 1 = 平移
+                                  ? training::g_yaw_rate_high
+                                  : training::g_yaw_rate_low;
+      const double max_step_yaw = yaw_rate * dt;
+      const double max_step_pitch = training::g_pitch_max_rate * dt;
+
       const double dy = std::remainder(yaw_lp - prev_yaw, 2.0 * M_PI);
       const double dp = pitch_lp - prev_pitch;
 
-      cmd.yaw = std::remainder(prev_yaw + std::clamp(dy, -max_step, max_step), 2.0 * M_PI);
-      cmd.pitch = prev_pitch + std::clamp(dp, -max_step, max_step);
+      cmd.yaw = std::remainder(prev_yaw + std::clamp(dy, -max_step_yaw, max_step_yaw),
+                               2.0 * M_PI);
+
+      // 静止靶锁定后冻结俯仰：|elev| 连续很小 ⇒ 认为已对准，不再修正俯仰
+      if (training::g_motion == 0 && std::abs(elev) < 0.5 * M_PI / 180.0)
+      {
+        if (++state_lock_frames >= 10)
+          training::g_pitch_locked = true;
+      }
+      else if (training::g_motion != 0 || std::abs(elev) > 2.0 * M_PI / 180.0)
+      {
+        state_lock_frames = 0;
+        training::g_pitch_locked = false;
+      }
+
+      if (training::g_pitch_locked)
+        cmd.pitch = prev_pitch; // 冻结
+      else
+        cmd.pitch = prev_pitch + std::clamp(dp, -max_step_pitch, max_step_pitch);
 
       prev_yaw = cmd.yaw;
       prev_pitch = cmd.pitch;

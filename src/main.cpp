@@ -1,11 +1,11 @@
 #include "lessons.hpp"
 #include "io_context.hpp"
 
-#include "ballistics.hpp" // g_ballistics_drag / g_gimbal_yaw
+#include "ballistics.hpp"   // g_ballistics_drag / g_gimbal_yaw
 #include "debug_flags.hpp"
 #include "talos_truth.hpp"
 
-#include <opencv2/calib3d.hpp>
+#include <opencv2/calib3d.hpp>   // cv::projectPoints（画蓝准星要用）
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -88,7 +88,7 @@ namespace
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
   }
 
-  // 云台系 -> 世界系（模式见 training::g_g2w_mode，k 键切换）
+  // 云台系 → 世界系（模式见 training::g_g2w_mode，k 键切换）
   Eigen::Matrix3d r_gimbal_to_world(const Eigen::Quaterniond &imu_q)
   {
     const Eigen::Matrix3d R = imu_q.toRotationMatrix();
@@ -113,7 +113,7 @@ namespace
     }
   }
 
-  // 世界系点 -> 像素。用于把弹道解算出的击打点画到画面上。
+  // 世界系点 → 像素。用于把弹道解算出的击打点画到画面上。
   bool world_to_pixel(const Eigen::Vector3d &p_world,
                       const Eigen::Quaterniond &imu_q,
                       const training::CameraCalibration &cal,
@@ -122,11 +122,11 @@ namespace
     if (!cal.valid())
       return false;
     const Eigen::Matrix3d R_g2w = r_gimbal_to_world(imu_q);
-    const Eigen::Vector3d p_g = R_g2w.transpose() * p_world; // -> 云台系
+    const Eigen::Vector3d p_g = R_g2w.transpose() * p_world;          // → 云台系
     const Eigen::Vector3d p_c = cal.camera_to_gimbal.transpose() *
-                                (p_g - cal.camera_to_gimbal_translation); // -> 相机系
+                                (p_g - cal.camera_to_gimbal_translation);   // → 相机系
     if (p_c.z() <= 0.1)
-      return false; // 在相机后方
+      return false;                                                   // 在相机后方
 
     std::vector<cv::Point3f> obj{cv::Point3f(static_cast<float>(p_c.x()),
                                              static_cast<float>(p_c.y()),
@@ -154,7 +154,7 @@ namespace
     if (px.x < 0 || px.y < 0 || px.x >= canvas.cols || px.y >= canvas.rows)
       return;
 
-    const cv::Scalar kBlue(255, 128, 0); // BGR
+    const cv::Scalar kBlue(255, 128, 0);      // BGR
     const cv::Point c(cvRound(px.x), cvRound(px.y));
     cv::drawMarker(canvas, c, kBlue, cv::MARKER_CROSS, 26, 2, cv::LINE_AA);
     cv::circle(canvas, c, 11, kBlue, 2, cv::LINE_AA);
@@ -273,8 +273,7 @@ namespace
   {
     const auto now = std::chrono::system_clock::now();
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        now.time_since_epoch())
-                        .count();
+                        now.time_since_epoch()).count();
     std::printf("[gui] %s -> %s\n", name, state);
     std::fflush(stdout);
     auto &ofs = gui_event_log();
@@ -578,8 +577,7 @@ int main(int argc, char **argv)
     {
       const auto now = std::chrono::system_clock::now();
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          now.time_since_epoch())
-                          .count();
+                          now.time_since_epoch()).count();
       ofs << ms << ",start,默认配置," << "ROI=off,refine=subpix,drag="
           << (training::g_ballistics_drag ? "on" : "off") << '\n';
       ofs.flush();
@@ -591,9 +589,9 @@ int main(int argc, char **argv)
 
   training::DetMode mode{training::DetMode::kArmor}; // 默认自瞄；按 m 切换
 
-  RoiMode roi_mode = RoiMode::kOff; // 默认关闭 ROI 裁剪
+  RoiMode roi_mode = RoiMode::kOff;          // 默认关闭 ROI 裁剪
   const float manual_zoom = 2.0F;
-  RefineMode refine_mode = RefineMode::kSubpix; // 默认开启亚像素精修
+  RefineMode refine_mode = RefineMode::kSubpix;   // 默认开启亚像素精修
   RuneCenterFilter rune_filter;
   const int subpix_win = 5;
   double last_ms = 0.0;
@@ -674,12 +672,10 @@ int main(int argc, char **argv)
         if (++diag_n % 60 == 0 && recent.size() == 60)
         {
           Eigen::Vector3d mean = Eigen::Vector3d::Zero();
-          for (const auto &p : recent)
-            mean += p;
+          for (const auto &p : recent) mean += p;
           mean /= static_cast<double>(recent.size());
           double var = 0.0;
-          for (const auto &p : recent)
-            var += (p - mean).squaredNorm();
+          for (const auto &p : recent) var += (p - mean).squaredNorm();
           const double sd = std::sqrt(var / static_cast<double>(recent.size()));
           std::printf("[tf] mode=%d  p_world=(%+.2f,%+.2f,%+.2f)  std=%.0f mm\n",
                       training::g_g2w_mode, mean.x(), mean.y(), mean.z(), sd * 1000.0);
@@ -709,11 +705,7 @@ int main(int argc, char **argv)
           {
             const Eigen::Vector3d tp(t.position[0], t.position[1], t.position[2]);
             const double d = (tp - tracking.position).squaredNorm();
-            if (d < best)
-            {
-              best = d;
-              pick = &t;
-            }
+            if (d < best) { best = d; pick = &t; }
           }
           truth_hist.push_back({input->timestamp,
                                 Eigen::Vector3d(pick->position[0],
@@ -737,13 +729,9 @@ int main(int argc, char **argv)
         {
           const Eigen::Vector3d p(t.position[0], t.position[1], t.position[2]);
           const double d = (p - tracking.position).squaredNorm();
-          if (d < best)
-          {
-            best = d;
-            tp = p;
-          }
+          if (d < best) { best = d; tp = p; }
         }
-        if (best < 25.0) // 5 m 以内才算同一块板
+        if (best < 25.0)   // 5 m 以内才算同一块板
         {
           tracking.pnp_err_mm = (tp - tracking.position).norm() * 1000.0;
           tracking.has_pnp_err = true;
@@ -793,7 +781,7 @@ int main(int argc, char **argv)
           training::g_gimbal_yaw = std::atan2(R(1, 0), R(0, 0));
           // imu_q = Rz(yaw)·Ry(−pitch)·Rx(roll)  ⇒  R(2,0) = sin(pitch)
           // 所以直接 asin 就得到 pitch。之前多了一个负号，导致
-          // g_gimbal_pitch 与 [IO] 打印的 pitch 反号 -> 伺服环越跑越抬头。
+          // g_gimbal_pitch 与 [IO] 打印的 pitch 反号 → 伺服环越跑越抬头。
           training::g_gimbal_pitch = std::asin(std::clamp(R(2, 0), -1.0, 1.0));
         }
 
@@ -832,8 +820,8 @@ int main(int argc, char **argv)
                        .count() < 0.5)
       {
         // ---- 丢目标时的指令保持（通讯层，关键）----
-        // 仿真器收到 target_state == 0 会把 target_angles 置空 -> 云台**停在原地**，
-        // 于是"有目标->无目标->有目标"会让云台走走停停、永远收敛不到位。
+        // 仿真器收到 target_state == 0 会把 target_angles 置空 → 云台**停在原地**，
+        // 于是"有目标→无目标→有目标"会让云台走走停停、永远收敛不到位。
         // 这里在丢目标 0.5 s 内继续发送上一条有效指令（control=true），把动作走完。
         command = last_cmd;
         command.shoot = false;
@@ -857,7 +845,7 @@ int main(int argc, char **argv)
         }
 
         const auto t_target{rec.t + std::chrono::duration_cast<training::TimePoint::duration>(
-                                        std::chrono::duration<double>(training::g_pred_lead_s))};
+                                    std::chrono::duration<double>(training::g_pred_lead_s))};
 
         const TruthSample *best{nullptr};
         double best_dt{1e9};
@@ -1031,7 +1019,7 @@ int main(int argc, char **argv)
       {
         // 偏航"高档"（平移靶用）分档；俯仰固定 0.15 rad/s 不在这里调
         static const double steps[] = {0.3, 0.6, 1.0, 1.5};
-        static int idx = 2; // 默认 1.0 rad/s
+        static int idx = 2;                     // 默认 1.0 rad/s
         idx = (idx + 1) % 4;
         training::g_yaw_rate_high = steps[idx];
         char buf[40];
@@ -1043,12 +1031,12 @@ int main(int argc, char **argv)
       {
         training::g_g2w_mode = (training::g_g2w_mode + 1) % 4;
         static const char *nm[] = {"R", "R^T", "Rz(+90)R", "Rz(-90)R"};
-        log_gui("k", "云台->世界 模式", nm[training::g_g2w_mode]);
+        log_gui("k", "云台→世界 模式", nm[training::g_g2w_mode]);
       }
       else if (key == 'n' || key == 'N')
       {
         static const double steps[] = {0.0, 0.10, 0.25, 0.50};
-        static int idx = 2; // 默认 250 ms
+        static int idx = 2;                      // 默认 250 ms
         idx = (idx + 1) % 4;
         training::g_pred_lead_s = steps[idx];
         char buf[32];

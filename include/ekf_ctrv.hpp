@@ -67,6 +67,8 @@ namespace training
     // 垂直速度上限（m/s）：地面机器人几乎不上下移动，钳紧可以抑制深度噪声带来的 z 抖动
     static constexpr double kMaxVz = 1.5;
 
+
+
     void configure(double q_accel_xy = 6.0, double q_accel_z = 2.0,
                    double q_theta = 0.05, double q_omega = 4.0,
                    double r_pos = 0.02)
@@ -96,7 +98,7 @@ namespace training
       x_(5) = p.z();
 
       P_.setZero();
-      P_.diagonal() << R_(0, 0), R_(1, 1), 25.0, 1.0, 4.0, R_(2, 2), 4.0;
+      P_.diagonal() << R_(0,0), R_(1,1), 25.0, 1.0, 4.0, R_(2,2), 4.0;
       initialized_ = true;
     }
 
@@ -238,7 +240,7 @@ namespace training
 
       Q(0, 0) = qxy * dt * dt * dt / 3.0;
       Q(1, 1) = Q(0, 0);
-      Q(2, 2) = qxy * dt; // 速度
+      Q(2, 2) = qxy * dt;            // 速度
       Q(3, 3) = q_theta_ * q_theta_ * dt;
       Q(4, 4) = q_omega_ * q_omega_ * dt;
       Q(5, 5) = qz * dt * dt * dt / 3.0;
@@ -253,9 +255,9 @@ namespace training
 
     bool initialized_{false};
     double q_accel_xy_{6.0};
-    double q_accel_eff_{6.0}; // 当前生效的（自适应后）
+    double q_accel_eff_{6.0};   // 当前生效的（自适应后）
     bool adaptive_{true};
-    double q_adapt_{1.0}; // 增益，1.0 = 不调整
+    double q_adapt_{1.0};       // 增益，1.0 = 不调整
     double q_accel_z_{2.0};
     double q_theta_{0.05};
     double q_omega_{4.0};

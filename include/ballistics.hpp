@@ -32,7 +32,7 @@ namespace training
   inline double g_gimbal_yaw{0.0};
   inline double g_gimbal_pitch{0.0};
 
-  // 云台系 -> 世界系 的固定偏置角（rad）。
+  // 云台系 → 世界系 的固定偏置角（rad）。
   // vision_recv_data 里的 yaw 与真实世界朝向差这个角度；
   // 可在运行时用 [ / ] 键微调，找到让云台真正对准目标的值。
   // 默认 0：真正的换算是 R_g2w = imu_q^T（见讲义），偏置只用于现场微调
@@ -59,17 +59,15 @@ namespace training
   // pitch 常数偏差，单位与**反馈角**一致（正值 = 让云台更"抬头"）。
   // 因为 cmd = −(反馈量) + offset，所以 offset 为正时实际是**压低**瞄准线。
   // 2026-11-17：日志证实伺服公式本身是对的（gp=23.82, elev=−5.95, drop=1.21
-  // -> cmd=−19.08 -> 目标反馈 +19.08 = A(17.87)+drop(1.21)），
+  // → cmd=−19.08 → 目标反馈 +19.08 = A(17.87)+drop(1.21)），
   // 问题在**命令没有被执行**（大量 target_state=0 让仿真器把 target_angles 置空）。
   // 所以偏置保持 0，先用 u/i 微调。
-  inline double g_pitch_offset{0.0};
+  // 2026-11-17：实测定为 −1.25°（见 172001 那轮：off=0 时收敛在 28.40，
+  // 每 −1° 偏置把枪口压低 1°，−1.2~−1.3 才落到靶心）
+  inline double g_pitch_offset{-1.25 * M_PI / 180.0};
   // yaw 的同类偏置（一般不用动，留作对准偏差微调）
   inline double g_yaw_offset{0.0};
 
-  // 瞄准算法模式（p 键之外的独立开关，暂用 o 键长按无效；代码里改）
-  //   0: current + drop          （没有误差反馈，会每帧叠加 drop -> 云台一路抬头）
-  //   1: current + 光轴偏差 + drop（伺服式：elev 就是"还差多少"，自动收敛，不会爬）
-  inline int g_aim_mode{1};
 
   // ---- 整车运动状态（由 lesson04 每帧判定，lesson05 用来选限速档位/冻结策略）----
   //   0 = 静止   1 = 平移   2 = 自旋
@@ -81,8 +79,8 @@ namespace training
   inline bool g_calib{false};
 
   // 目标在**云台系**下的位置/速度。由 lesson04 直接写入（PnP 结果，不经过世界系变换），
-  // 因此与"云台系->世界系"的约定无关。lesson05 用它算角度增量，天然消除坐标系偏置。
-  // 云台系->世界系 的换算模式（运行时用 k 键切换，用[静止靶时 p_world 的抖动最小]来挑）
+  // 因此与"云台系→世界系"的约定无关。lesson05 用它算角度增量，天然消除坐标系偏置。
+  // 云台系→世界系 的换算模式（运行时用 k 键切换，用[静止靶时 p_world 的抖动最小]来挑）
   //   0: R(imu_q)            1: R(imu_q)^T
   //   2: Rz(+90°)·R(imu_q)   3: Rz(-90°)·R(imu_q)
   inline int g_g2w_mode{1};
@@ -94,10 +92,7 @@ namespace training
   inline bool g_target_cam_valid{false};
   // 目标在**相机系**下的速度（由最近几帧 PnP 位置最小二乘拟合）。
   // 不经过世界系，因此不受任何坐标系偏置影响 —— 提前量的方向就靠它。
-  inline Eigen::Vector3d g_target_cam_vel{Eigen::Vector3d::Zero()};
-  // 相机系->云台系 的旋转（由 lesson04 每帧写入，lesson05 用来旋转速度）
-  inline Eigen::Matrix3d g_camera_to_gimbal{Eigen::Matrix3d::Identity()};
-  inline bool g_calibration_valid{false};
+  // 相机系→云台系 的旋转（由 lesson04 每帧写入，lesson05 用来旋转速度）
 
   inline Eigen::Vector3d g_target_gimbal{Eigen::Vector3d::Zero()};
   inline Eigen::Vector3d g_target_gimbal_vel{Eigen::Vector3d::Zero()};

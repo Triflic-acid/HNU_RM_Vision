@@ -60,11 +60,16 @@ namespace training
     // 关键：configure() 之前从未被调用，滤波器一直用默认 q_accel=8 m/s²，
     // 意味着每帧速度允许抖动 √(q·dt) ≈ 0.68 m/s，
     // 预测 250 ms 时被放大成 ±170 mm —— 这就是"静止靶也抖"的根因。
-    constexpr double kQAccel{0.60};
+    constexpr double kQAccel{0.30};   // 2026-11-17 复原：11-16 09:35 能跟住平移靶的版本用 0.30
     // ---- 整车运动状态判定的门限 ----
     constexpr double kStaticSpeed{0.15};    // m/s，低于它认为静止
     constexpr double kSpinOmegaDetect{1.0}; // rad/s，高于它认为自旋
-    constexpr int kMotionVotes{8};          // 连续 8 帧一致才切换状态   // 水平加速度标准差 m/s²
+    constexpr int kMotionVotes{8};          // 连续 8 帧一致才切换状态
+    // 自旋检测开关。当前**关闭**：CTRV 的 ω 在平移时会被噪声推到 ±12，
+    // 一旦误判成自旋就又会用 CTRV 出预测（正是要修的那个 bug）。
+    // 自旋任务重启时，应先实现"换板率"判据（相邻两帧位置跳 > 0.25 m 计一次），
+    // 再打开这个开关。
+    constexpr bool kEnableSpinDetect{false};
     constexpr double kRPosInit{0.08};       // 初始量测标准差 m（之后被 set_R 覆盖）
     constexpr double kQAccelZ{0.02};        // 垂直加速度噪声（几乎为 0：地面机器人不做垂直机动）
     constexpr double kQTheta{0.05};         // 航向抖动 rad
@@ -106,7 +111,10 @@ namespace training
     // 旋转 EKF：omega 超过它才认为是旋转靶；装甲板 yaw 的量测噪声
     // 整车观测（多板圆周 EKF）。打开后旋转段用它的预测；关闭则退回纯 CTRV。
     constexpr bool kOnlineArmorNum{false}; // 板数在线判别（默认关：单板时不可辨识，易抖动）
-    constexpr bool kEnableSpinEkf{true};
+    // 2026-11-17 复原：11-16 09:35 的版本是 false。
+    // 打开后平移靶的 ω 会被毛刺带到 ±12（kMaxOmega 限幅），
+    // radius_trusted() 又偶发放行 ⇒ predict_future 按圆周外推 ⇒ 预测直接飞掉。
+    constexpr bool kEnableSpinEkf{false};
     constexpr double kSpinOmegaThresh{1.0}; // rad/s
     constexpr double kAngleSigma{0.20};     // rad
     constexpr double kDistRatioMax{1.8};    // PnP 距离 / 单目距离 上限
@@ -124,7 +132,7 @@ namespace training
     //   横向 σ_lat = Z·σ_px/fx        （∝ Z）
     //   深度 σ_dep = Z²·σ_px/(fx·W)   （∝ Z²，且与板宽 W 成反比）
     // 2 m、小板(135 mm)、σ_px=3 px：σ_lat≈4.6 mm，σ_dep≈82 mm（实测 80 mm）
-    constexpr double kCornerNoisePx{5.0};
+    constexpr double kCornerNoisePx{3.0};   // 2026-11-17 复原（与 kQAccel 成对）
     constexpr double kSigLatMin{0.002};
     constexpr double kSigLatMax{0.05};
     constexpr double kSigDepMin{0.01};
@@ -483,8 +491,9 @@ namespace training
       state.prev_q_stamp = timestamp;
       state.has_prev_q = true;
 
-      if (training::dbg::cv_filter)
-        state.kf.set_R(M * R_cam * M.transpose() * inflate * inflate);
+      // 两个滤波器都要给各向异性 R：CV 现在是"静止 + 平移"的主滤波器，
+      // 只在对比开关打开时才设 R 会让它退化成标量噪声。
+      state.kf.set_R(M * R_cam * M.transpose() * inflate * inflate);
       state.ekf.set_R(M * R_cam * M.transpose() * inflate * inflate);
     }
 
@@ -557,21 +566,23 @@ namespace training
 
     state.position = state.ekf.position();
     state.velocity = state.ekf.velocity();
-    state.spin_rate = state.ekf.turn_rate(); // rad/s，供日志/诊断
+    // 只对外报告"真的在自旋"时的 ω。CTRV 在后台的 ω 可能被噪声带大，
+    // 直接写进日志会让人误以为又发散了。
+    state.spin_rate = 0.0;
 
     // ================= 整车运动状态判定 =================
-    // 依据两个与坐标系无关的量：|v|（旋转不改变模长）和 |ω|（EKF/圆周模型给出）。
-    //   静止：|v| < kStaticSpeed                     → 用匀速卡尔曼（CV）出状态
-    //   自旋：|ω| > kSpinOmega                       → CTRV + 圆周模型出预测
-    //   平移：其余                                  → CTRV
+    //   静止：|v| < kStaticSpeed          → KalmanCV
+    //   平移：其余                        → KalmanCV（匀速直线是 CV 的精确模型）
+    //   自旋：|ω| > kSpinOmega（当前关闭）→ CTRV + 圆周模型
     // 用"连续 kMotionVotes 帧一致才切换"做迟滞，避免抖动。
     {
       const double speed = state.velocity.norm();
-      const double omega = std::abs(state.spin_ekf.initialized() ? state.spin_ekf.omega()
-                                                                 : state.spin_rate);
+      // ω 只用 CTRV 的（spin_ekf 关闭时它的 ω 不可信；即便开启，
+      // 平移靶上它也会被毛刺带到 ±12）
+      const double omega = std::abs(state.ekf.turn_rate());
 
       TrackingState::Motion want = TrackingState::Motion::kMoving;
-      if (omega > kSpinOmegaDetect)
+      if (kEnableSpinDetect && omega > kSpinOmegaDetect)
         want = TrackingState::Motion::kSpinning;
       else if (speed < kStaticSpeed)
         want = TrackingState::Motion::kStatic;
@@ -600,11 +611,19 @@ namespace training
       }
     }
 
-    // 静止靶：用匀速卡尔曼的输出（对静止目标更稳，不引入 ω 的自由度）
-    if (state.motion == TrackingState::Motion::kStatic)
+    // 静止 / 平移：都用匀速卡尔曼（CV）。
+    // 理由：平移是匀速直线运动的**精确**模型；CTRV 多出的 ω 在"只测位置"下
+    // 几乎不可观测，目标一平移就被噪声推到 kMaxOmega(±12)，250 ms 外推把速度方向
+    // 转 3 rad，预测直接飞几米（见 172001 那轮：spin ±12、pz 偏到 −13 m）。
+    // 只有"自旋"才需要 ω，那时改用 CTRV。
+    const bool use_cv{state.motion != TrackingState::Motion::kSpinning};
+    if (use_cv)
     {
       if (!state.kf.initialized())
-        state.kf.init(state.position);
+      {
+        state.kf.configure(kQAccel, kRPosInit);
+        state.kf.init(state.position);   // 以 CTRV 当前估计为起点，避免跳变
+      }
       state.kf.predict(dt);
       state.kf.update(p_world);
       state.cv_position = state.kf.position();
@@ -618,7 +637,8 @@ namespace training
     training::g_motion = static_cast<int>(state.motion);
 
     // ---- 对比开关：同时跑匀速卡尔曼，供离线对比（不影响主链路）----
-    if (training::dbg::cv_filter)
+    // use_cv 为 true 时 CV 已经跑过，再跑一次会让它一帧预测两次。
+    if (training::dbg::cv_filter && !use_cv)
     {
       if (!state.kf.initialized())
       {
@@ -695,9 +715,11 @@ namespace training
       state.spin_active = false; // 只用 CTRV
     }
 
-    Eigen::Vector3d p_pred = state.spin_active
-                                 ? state.spin_ekf.predict_future(training::g_pred_lead_s)
-                                 : state.ekf.predict_future(training::g_pred_lead_s);
+    Eigen::Vector3d p_pred =
+        state.spin_active
+            ? state.spin_ekf.predict_future(training::g_pred_lead_s)
+            : (use_cv ? state.kf.predict_future(training::g_pred_lead_s)
+                      : state.ekf.predict_future(training::g_pred_lead_s));
     if (!state.spin_active)
     {
       // 速度估计不准时，250 ms 外推会把位置放大成米级跳变；限幅后最坏只是"提前量不足"
@@ -764,43 +786,10 @@ namespace training
            calibration.camera_to_gimbal.cols() == 3)
               ? calibration.camera_to_gimbal
               : Eigen::Matrix3d::Identity();
-      if (calibration.camera_to_gimbal.rows() == 3 &&
-          calibration.camera_to_gimbal.cols() == 3)
-      {
-        training::g_camera_to_gimbal = calibration.camera_to_gimbal;
-        training::g_calibration_valid = true;
-      }
       training::g_target_cam = p_cam;
       training::g_target_cam_valid = true;
 
       // 相机系速度：最近 6 帧最小二乘（不经过世界系，方向不会被坐标偏置带歪）
-      {
-        static std::deque<std::pair<double, Eigen::Vector3d>> hist;
-        const double t_now =
-            std::chrono::duration<double>(timestamp.time_since_epoch()).count();
-        hist.emplace_back(t_now, p_cam);
-        while (hist.size() > 6)
-          hist.pop_front();
-
-        if (hist.size() >= 3)
-        {
-          const double t0 = hist.front().first;
-          double sx = 0, sxx = 0;
-          Eigen::Vector3d sp = Eigen::Vector3d::Zero(), sxp = Eigen::Vector3d::Zero();
-          for (const auto &h : hist)
-          {
-            const double t = h.first - t0;
-            sx += t;
-            sxx += t * t;
-            sp += h.second;
-            sxp += t * h.second;
-          }
-          const double n = static_cast<double>(hist.size());
-          const double den = n * sxx - sx * sx;
-          if (std::abs(den) > 1e-9)
-            training::g_target_cam_vel = (n * sxp - sx * sp) / den;
-        }
-      }
       training::g_target_gimbal =
           R_c2g_e * p_cam + calibration.camera_to_gimbal_translation;
       const Eigen::Vector3d v_world = state.velocity;
